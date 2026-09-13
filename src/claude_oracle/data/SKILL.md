@@ -35,6 +35,13 @@ planned only after reading the previous round's findings.
 
 ## One canonical report
 
+Use `RoundSession.status()` for the machine-readable handoff: lifecycle is
+separate from `research_outcome` (`unknown`, `complete`, `partial`, or `failed`).
+It also reports phase/progress, active attempt, last update, artifact paths, and
+next action. After editing the canonical report, record the caller-owned
+checkpoint with `session.checkpoint(revision=..., through_round=...)`; it is
+validated against completed rounds and never advanced automatically.
+
 Create **one canonical report by default**, at the session's `canonical.md`.
 Create additional canonical documents only when the user explicitly requests
 them. Keep the same report throughout the run, including across resumptions.

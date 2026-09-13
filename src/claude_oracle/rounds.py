@@ -10,7 +10,23 @@ import tempfile
 
 
 DEFAULT_ROUNDS = 1
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+_OUTCOMES = {"complete", "partial", "failed", "unknown"}
+
+
+def _status_defaults(state: dict) -> dict:
+    """Apply v1-compatible defaults for the observable handoff contract."""
+    state.setdefault("research_outcome", "unknown")
+    state.setdefault("current_phase", "idle")
+    state.setdefault("progress", {"scouts": {"completed": 0, "total": 0}, "organizers": {"completed": 0, "total": 0}})
+    state.setdefault("active_attempt", None)
+    state.setdefault("last_updated_at", state.get("created_at", _now()))
+    state.setdefault("next_action", "Run the first research round")
+    state.setdefault("checkpoint", {"path": "canonical.md", "revision": None, "through_round": 0})
+    state.setdefault("artifact_paths", [])
+    state.setdefault("reported_usage", {"input_tokens": 0, "output_tokens": 0, "quota_units": 0.0})
+    return state
 
 
 def _positive_integer(value: int, label: str) -> int:
@@ -123,6 +139,15 @@ class RoundSession:
         )
         _write_json(session.path / "session.json", {
             "schema_version": SCHEMA_VERSION,
+            "research_outcome": "unknown",
+            "current_phase": "idle",
+            "progress": {"scouts": {"completed": 0, "total": 0}, "organizers": {"completed": 0, "total": 0}},
+            "active_attempt": None,
+            "last_updated_at": _now(),
+            "next_action": "Run the first research round",
+            "checkpoint": {"path": "canonical.md", "revision": None, "through_round": 0},
+            "artifact_paths": [],
+            "reported_usage": {"input_tokens": 0, "output_tokens": 0, "quota_units": 0.0},
             "question": question.strip(),
             "rounds": rounds,
             "chains": chains,
@@ -147,8 +172,9 @@ class RoundSession:
         from .sdk import MAX_CHAINS
 
         state = json.loads((self.path / "session.json").read_text(encoding="utf-8"))
-        if not isinstance(state, dict) or state.get("schema_version") != SCHEMA_VERSION:
+        if not isinstance(state, dict) or state.get("schema_version") not in {1, SCHEMA_VERSION}:
             raise ValueError("Unsupported Oracle round session format")
+        state = _status_defaults(state)
         _positive_integer(state.get("rounds"), "Rounds")
         _positive_integer(state.get("chains"), "Chains")
         completed = state.get("completed_rounds")
@@ -164,9 +190,28 @@ class RoundSession:
             }
             or not isinstance(state.get("local_tools"), bool)
             or not isinstance(state.get("show_dollars"), bool)
+            or state.get("research_outcome") not in _OUTCOMES
+            or not isinstance(state.get("progress"), dict)
+            or not isinstance(state.get("checkpoint"), dict)
+            or not isinstance(state["checkpoint"].get("through_round"), int)
+            or not 0 <= state["checkpoint"]["through_round"] <= completed
+            or not isinstance(state.get("artifact_paths"), list)
+            or not isinstance(state.get("reported_usage"), dict)
         ):
             raise ValueError("Invalid Oracle round session state")
         return state
+
+    def checkpoint(self, *, revision: str, through_round: int, path: str = "canonical.md") -> dict:
+        """Record the caller's editorial checkpoint; never advances automatically."""
+        state = self.status()
+        if not isinstance(revision, str) or not revision.strip():
+            raise ValueError("Checkpoint revision is required")
+        if not isinstance(through_round, int) or not 0 <= through_round <= state["completed_rounds"]:
+            raise ValueError("Checkpoint round must be between zero and completed rounds")
+        state["checkpoint"] = {"path": path, "revision": revision, "through_round": through_round}
+        state["last_updated_at"] = _now()
+        _write_json(self.path / "session.json", state)
+        return state["checkpoint"]
 
     async def run_round(self, prompts: list[dict] | None = None, *, verbose: bool = False) -> str:
         """Execute one research round; later rounds require the caller's new plan.
@@ -216,6 +261,12 @@ class RoundSession:
             }
             state["attempts"].append(attempt)
             state["status"] = "running"
+            state["research_outcome"] = "unknown"
+            state["current_phase"] = "research"
+            state["active_attempt"] = relative.as_posix()
+            state["progress"] = {"scouts": {"completed": 0, "total": len(prompts or [])}, "organizers": {"completed": 0, "total": len({p["chain"] for p in prompts or []})}}
+            state["last_updated_at"] = _now()
+            state["next_action"] = "Wait for research results"
             _write_json(self.path / "session.json", state)
             oracle = OracleSDK(
                 chains=state["chains"], verbose=verbose,
@@ -236,11 +287,38 @@ class RoundSession:
                 attempt.update(status="completed", finished_at=_now())
                 state["completed_rounds"] = number
                 state["status"] = "rounds_complete" if number == state["rounds"] else "awaiting_plan"
+                errors = oracle.metrics.scout_errors + oracle.metrics.compressor_errors
+                state["research_outcome"] = "complete" if errors == 0 else "partial"
+                state["current_phase"] = "complete"
+                state["active_attempt"] = None
+                state["progress"] = {"scouts": {"completed": oracle.metrics.scout_count, "total": oracle.scouts_total}, "organizers": {"completed": oracle.metrics.compressor_count, "total": oracle.metrics.chain_count}}
+                usage = asdict(oracle.metrics.total_usage)
+                total_usage = state["reported_usage"]
+                for key in ("input_tokens", "output_tokens", "quota_units"):
+                    total_usage[key] = total_usage.get(key, 0) + usage.get(key, 0)
+                state["reported_usage"] = total_usage
+                state["artifact_paths"] = [
+                    (self.path / relative / name).as_posix()
+                    for name in ("prompts.json", "report.md", "metrics.json")
+                    if (self.path / relative / name).exists()
+                ]
+                state["last_updated_at"] = _now()
+                state["next_action"] = "Revise canonical.md and record a checkpoint" if state["status"] == "rounds_complete" else "Prepare a fresh plan for the next round"
                 _write_json(self.path / "session.json", state)
             except BaseException as exc:
-                attempt.update(status="failed", error=str(exc) or type(exc).__name__, finished_at=_now())
+                failed_usage = asdict(oracle.metrics.total_usage)
+                attempt.update(status="failed", error=str(exc) or type(exc).__name__, finished_at=_now(), usage=failed_usage)
+                total_usage = state["reported_usage"]
+                for key in ("input_tokens", "output_tokens", "quota_units"):
+                    total_usage[key] = total_usage.get(key, 0) + failed_usage.get(key, 0)
+                state["reported_usage"] = total_usage
                 state["completed_rounds"] = number - 1
                 state["status"] = "failed"
+                state["research_outcome"] = "failed"
+                state["current_phase"] = "failed"
+                state["active_attempt"] = None
+                state["last_updated_at"] = _now()
+                state["next_action"] = "Retry the failed round with a fresh plan"
                 # Keep the original failure if recording it also fails (e.g. disk full).
                 try:
                     if oracle.planned_prompts:

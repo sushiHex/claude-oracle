@@ -54,6 +54,24 @@ def test_round_budget_rejected_before_creating_files(value):
     assert not Path("session").exists()
 
 
+def test_checkpoint_is_caller_controlled_and_validated():
+    session = RoundSession.create("question")
+    with pytest.raises(ValueError, match="between zero"):
+        session.checkpoint(revision="r1", through_round=1)
+    assert session.checkpoint(revision="draft-r0", through_round=0)["through_round"] == 0
+    assert session.status()["checkpoint"]["revision"] == "draft-r0"
+
+
+def test_status_exposes_compatible_defaults_for_v1_state():
+    session = RoundSession.create("question")
+    state = session.status()
+    state["schema_version"] = 1
+    (session.path / "session.json").write_text(json.dumps(state), encoding="utf-8")
+    restored = RoundSession.open(session.path).status()
+    assert restored["research_outcome"] == "unknown"
+    assert restored["checkpoint"]["through_round"] == 0
+
+
 def test_default_session_and_existing_directory_are_preserved():
     session = RoundSession.create("question", directory="session")
     report = session.path / "canonical.md"
