@@ -73,12 +73,19 @@ MODEL_SONNET = "sonnet"
 MODEL_OPUS = "opus"
 
 # Max 20x credit system (source: oreateai.com reverse-engineering, ~Mar 2026)
-# Credits = (input_tokens * model_weight) + (output_tokens * model_weight * 5)
-# Output costs 5x input. Model weights: Haiku=0.2, Sonnet=1.0, Opus=1.67
+# Credits = (billable_input + output_tokens * 5) * model_weight, where
+#   billable_input = input_tokens
+#                  + cache_read_input_tokens * 0.1
+#                  + cache_creation_input_tokens * 1.25
+# Output costs 5x input; cached reads are discounted and cache writes carry a
+# premium (Anthropic's published API cache pricing, 5-minute default TTL).
+# Model weights: Haiku=0.2, Sonnet=1.0, Opus=1.67.
 # Anthropic can change these at any time — treat as approximate.
 SESSION_CREDITS = 11_000_000    # Max 20x 5-hour session
 WEEKLY_CREDITS = 83_330_000     # Max 20x 7-day rolling
 OUTPUT_MULTIPLIER = 5           # output tokens cost 5x input
+CACHE_READ_MULTIPLIER = 0.1     # cached prompt reads bill ~0.1x fresh input
+CACHE_WRITE_MULTIPLIER = 1.25   # cache writes bill ~1.25x fresh input
 MODEL_WEIGHTS = {MODEL_HAIKU: 0.2, MODEL_SONNET: 1.0, MODEL_OPUS: 1.67}
 
 SCOUT_SUFFIX = (
@@ -396,12 +403,18 @@ def _extract_usage(message, model: str = MODEL_SONNET) -> UsageStats:
         for field_name, value in values.items():
             setattr(stats, field_name, value or 0)
     weight = MODEL_WEIGHTS.get(model, 1.0)
-    stats.quota_units = (
+    # Cached prompt tokens are billed at a discount/premium relative to fresh
+    # input. These ratios mirror Anthropic's published API cache pricing and are
+    # approximate for the subscription credit system — as with MODEL_WEIGHTS,
+    # treat as an estimate. Counting a cache read as full-price input overstates
+    # the dominant term: a real Anderson turn showed input_tokens=3 against
+    # cache_read_input_tokens=3,040.
+    billable_input = (
         stats.input_tokens
-        + stats.cache_read_input_tokens
-        + stats.cache_creation_input_tokens
-        + stats.output_tokens * OUTPUT_MULTIPLIER
-    ) * weight
+        + stats.cache_read_input_tokens * CACHE_READ_MULTIPLIER
+        + stats.cache_creation_input_tokens * CACHE_WRITE_MULTIPLIER
+    )
+    stats.quota_units = (billable_input + stats.output_tokens * OUTPUT_MULTIPLIER) * weight
     return stats
 
 
@@ -550,6 +563,11 @@ Return ONLY a JSON array:
                 prompt=prompt,
                 options=ClaudeAgentOptions(
                     model=MODEL_SONNET,
+                    # Decomposition is mechanical JSON emission. Benchmarked
+                    # low/medium/high at 24 prompts across 3 chains: all passed
+                    # 100% (count, chain balance, distinct dimensions), so the
+                    # default `high` bought nothing for 1.7x the tokens.
+                    effort="low",
                     allowed_tools=["Read", "Grep", "Glob"],
                     system_prompt="Decompose research questions into orthogonal sub-prompts. Output ONLY valid JSON.",
                 ),
@@ -597,6 +615,14 @@ Return ONLY a JSON array:
                 "model": MODEL_HAIKU,
                 "allowed_tools": tools,
                 "disallowed_tools": ["Bash", "Write", "Edit", "NotebookEdit", "Agent"],
+                # Scouting is search-and-report, not multi-step reasoning, so the
+                # thinking budget bought nothing: benchmarked -26% output tokens
+                # with citation breadth unchanged (12.4 -> 13.6 domains) and zero
+                # empty results across 5 runs.
+                "thinking": {"type": "disabled"},
+                # Runaway guard only. Observed working range is 9-23 turns, so
+                # this never binds on a healthy Smith — do not lower below 25.
+                "max_turns": 30,
             }
             if mcp:
                 opts["mcp_servers"] = mcp
@@ -859,6 +885,15 @@ Organize, don't compress — the calling session will do the editorial judgment.
             usage = _unknown_usage()
             anderson_opts = {
                 "model": MODEL_SONNET,
+                # Biggest single saving in the pipeline (~50% of run spend).
+                # Benchmarked at production scale (10 reports x 8K chars) with
+                # planted adversarial items: low/medium/high all scored 100% on
+                # marker recall, contradiction detection, stale-vs-fresh
+                # rejection, and error correction. `high` emitted 3.1x the
+                # tokens for identical output — it pads rather than preserving
+                # more signal, which contradicts the "organize, don't compress"
+                # mandate in the prompt above.
+                "effort": "low",
                 "allowed_tools": ["Read", "Grep", "Glob"],
                 "system_prompt": "You are Anderson. Organize Smith reports into structured findings. Preserve all unique signal — the calling session handles final synthesis.",
             }
@@ -1076,7 +1111,7 @@ Organize, don't compress — the calling session will do the editorial judgment.
 **Oracle SDK Execution Metrics**
 - Architecture: {arch}
 - Total time: {m.total_time:.0f}s
-- Total tokens: {total.total_tokens:,} (in: {total.input_tokens:,} | out: {total.output_tokens:,})
+- Total tokens: {total.total_tokens:,} (in: {total.input_tokens:,} | out: {total.output_tokens:,} | cache r/w: {total.cache_read_input_tokens:,}/{total.cache_creation_input_tokens:,})
 {cost_line}
 - Smiths: {m.scout_count} ({m.scout_errors} errors)
 - Andersons: {m.compressor_count} ({m.compressor_errors} errors)

@@ -13,7 +13,11 @@ from claude_oracle import sdk
 from claude_oracle.sdk import (
     OracleSDK,
     ScoutResult,
+    CACHE_READ_MULTIPLIER,
+    CACHE_WRITE_MULTIPLIER,
     MAX_CHAINS,
+    MODEL_WEIGHTS,
+    OUTPUT_MULTIPLIER,
     SCOUT_SUFFIX,
     _extract_json_array,
     _extract_usage,
@@ -206,6 +210,37 @@ def test_extract_usage_includes_cache_token_fields():
     assert s.cache_creation_input_tokens == 6
     assert s.total_tokens == 18
     assert s.usage_available is True
+
+
+def test_extract_usage_weights_cache_tokens_against_fresh_input():
+    # Cache reads bill ~0.1x fresh input and cache writes ~1.25x; charging them
+    # at 1.0x overstates the dominant term on cache-heavy Anderson turns.
+    class M:
+        usage = {
+            "input_tokens": 3,
+            "output_tokens": 4000,
+            "cache_read_input_tokens": 3040,
+            "cache_creation_input_tokens": 400,
+        }
+
+    s = _extract_usage(M(), "sonnet")
+    expected_input = 3 + 3040 * CACHE_READ_MULTIPLIER + 400 * CACHE_WRITE_MULTIPLIER
+    assert s.quota_units == (expected_input + 4000 * OUTPUT_MULTIPLIER) * 1.0
+    # Unweighted accounting would have charged the full 3,440 cached tokens.
+    assert s.quota_units < (3 + 3040 + 400 + 4000 * OUTPUT_MULTIPLIER) * 1.0
+
+
+def test_extract_usage_applies_model_weight_after_cache_weighting():
+    class M:
+        usage = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_input_tokens": 1000,
+            "cache_creation_input_tokens": 0,
+        }
+
+    haiku = _extract_usage(M(), "haiku")
+    assert haiku.quota_units == 1000 * CACHE_READ_MULTIPLIER * MODEL_WEIGHTS["haiku"]
 
 
 def test_progress_callback_reports_completed_work():
