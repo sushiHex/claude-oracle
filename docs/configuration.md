@@ -59,7 +59,7 @@ Chain isolation means Python supplies each organizer only its own chain's scout 
 
 Keep credentials and sensitive findings out of source control. This repository ignores `oracle-report-*.md` and keeps `research/` private; those exclusions do not automatically apply to other projects where you run Oracle.
 
-Each new round session includes a `.gitignore` that excludes its contents, including when you choose a directory outside `research/`. This is a Git convenience, not encryption or access control. Session metadata stores the research question and tool settings but no authentication tokens. Keep the full session when preserving private research, and resume with the same directory to retain the canonical report and round history.
+Each new round session includes a `.gitignore` that excludes its contents, including when you choose a directory outside `research/`. This is a Git convenience, not encryption or access control. Session metadata stores the research question, tool settings, per-round progress and outcome, attempt history, relative artifact paths, cumulative estimated usage, and the checkpoint your session records — but no authentication tokens and no scout content. Keep the full session when preserving private research, and resume with the same directory to retain the canonical report and round history.
 
 ## Troubleshooting
 

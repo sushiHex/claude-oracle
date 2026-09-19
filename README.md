@@ -66,7 +66,7 @@ The `claude-oracle` console command is equivalent. Without supplied prompts, a S
 | `--rounds N` | Set the research round budget; default `1`. Multiple rounds create a resumable session and return control after each round. |
 | `--session-dir PATH` | Create a session at a new directory, including for a single round. Multiple rounds otherwise use `research/oracle-<unique-id>`. |
 | `--resume PATH` | Run the next round with a fresh JSON prompt array on stdin, using saved session settings. |
-| `--session-status PATH` | Print session progress as JSON without running models or reading stdin. |
+| `--session-status PATH` | Print the session's lifecycle, research outcome, live phase and progress, checkpoint, artifact paths, and usage as JSON. Never runs models or reads stdin. |
 | `--verbose`, `-v` | Add per-scout tool activity to the progress log. |
 | `--report`, `-r` | Also save `oracle-report-YYYYMMDD-HHMMSS.md` in the current directory. |
 | `--local` | Grant scouts local `Read`, `Grep`, and `Glob` tools for repository research. |
@@ -95,6 +95,10 @@ The `/oracle` skill manages the full workflow in your current session:
 </picture>
 
 **One canonical report is the default.** It is updated in place between rounds; additional canonical documents are created only when you ask. Per-round plans, raw reports, and metrics remain available as supporting history.
+
+**Progress is readable while research runs.** `--session-status` (or `RoundSession.status()`) reports lifecycle and research outcome as separate things: a round can finish successfully while its `research_outcome` is `partial` because some scouts failed. Alongside those it returns the current phase, live scout and organizer counts, the active attempt, artifact paths, and cumulative usage — marked unavailable rather than zero when a model attempt reported none. Status reads never block on a running round and never start a model.
+
+When your session has revised the canonical report, record that with `RoundSession.checkpoint(revision=..., through_round=N)`. Oracle validates `N` against completed rounds and never advances the checkpoint itself — it tracks how far your writing has caught up with the evidence, and says nothing about whether the report is finished.
 
 The active session supplies the judgment and writing—Fable or Astra are preferred orchestrators when available. Oracle does not launch a separate manager. The **CLI and Python API execute one round per call**; `/oracle` follows the orchestration loop for you. Agents integrating the CLI should follow the [managed-round protocol](docs/agent-usage.md#managed-rounds). Ordinary CLI calls without a session keep their existing single-round output.
 
@@ -140,7 +144,7 @@ Read **[configuration and access boundaries](docs/configuration.md)** before ena
 
 ## Usage and reliability
 
-More chains and rounds increase model and tool usage: two chains over three rounds normally dispatch **60 scouts and 6 organizers**, plus the orchestrating session's work. Oracle assigns broad searching to Haiku and organization to Sonnet; savings depend on the task. The displayed quota percentages are unofficial estimates based on fixed assumptions, not your account's remaining balance. `--usd` is SDK-reported usage, not a subscription invoice.
+More chains and rounds increase model and tool usage: two chains over three rounds normally dispatch **60 scouts and 6 organizers**, plus the orchestrating session's work. Oracle assigns broad searching to Haiku and organization to Sonnet; savings depend on the task. The displayed quota percentages are unofficial estimates based on fixed assumptions, not your account's remaining balance. They weight cached prompt tokens at their published rates rather than as fresh input — cache reads cost a fraction, cache writes a premium — which matters because organizer turns are cache-dominated. `--usd` is SDK-reported usage, not a subscription invoice.
 
 Scouts have timeouts and a limited retry pass. Chains with no successful scouts skip organization. Some organizer failures preserve raw scout output; check the report for error or fallback sections before treating a run as complete. See [failure handling](docs/agent-usage.md#handle-results-and-failures).
 
