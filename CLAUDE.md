@@ -54,10 +54,15 @@ research/oracle-<id>/
   session.json    — schema-versioned state, atomically replaced (_atomic_write)
   canonical.md    — the caller's report; Oracle creates it and never rewrites it
   .round.lock     — non-blocking OS lock: one round writer per session
+  .session.lock   — blocking OS lock: serializes session.json read-modify-writes
   rounds/round-NNN-attempt-NNN/{prompts.json, report.md, metrics.json}
 ```
 
-Failed rounds are retained as attempts and do **not** consume a round from the budget; resuming retries the same round number in a new attempt directory. The lock deliberately does not cover `canonical.md`, because the caller is expected to revise it while the next round runs.
+Failed rounds are retained as attempts and do **not** consume a round from the budget; resuming retries the same round number in a new attempt directory. `.round.lock` deliberately does not cover `canonical.md`, because the caller is expected to revise it while the next round runs.
+
+**Two locks, two jobs.** `.round.lock` is non-blocking and admits one round writer. `.session.lock` is blocking and guards every `session.json` read-modify-write, because `checkpoint()` is called from outside the round — concurrently with a running round, by design. `_persist_state()` re-reads the latest `checkpoint` before each terminal write so a mid-round checkpoint is never clobbered, and `checkpoint()` validates against `completed_rounds` read inside the lock so it can never revert a finished round. Anything new that writes `session.json` must go through `_persist_state()` or take `_state_lock` itself.
+
+`status()` is the machine-readable handoff: lifecycle (`status`) is separate from `research_outcome` (`unknown`/`complete`/`partial`/`failed`), alongside `current_phase`, live `progress`, `active_attempt`, `artifact_paths` (relative, accumulated), `reported_usage`, and the caller-owned `checkpoint`. Status reads never block and never start models.
 
 ## Conventions
 - Refresh the installed skill with `python -m claude_oracle.install`; `~/.claude/skills/oracle/oracle_sdk.py` is a launcher that delegates to the installed package.
@@ -78,7 +83,8 @@ Failed rounds are retained as attempts and do **not** consume a round from the b
 - `max_turns: 30` on Smiths is a runaway guard; observed healthy range is 9–23 turns. **Do not lower below 25.**
 - An empty Smith result is an **error**, not a silent success — otherwise it passes the all-failed guard and contributes nothing downstream.
 - Preserve the recovery ladder: a failed Anderson stashes `fallback_scouts` so the report emits raw Smith output verbatim and recovery is "re-run Anderson", not "re-run 10 Smiths". The retry pass is skipped when more than half the Smiths failed (that pattern is systemic — auth or network — and a serial retry just repeats it slowly).
-- Quota percentages are estimates from a reverse-engineered credit model, not account balances. `--usd` is SDK-reported usage, not an invoice. Cached prompt tokens are reported separately from `input_tokens` and must be counted — ignoring them understated `quota_units` badly (a real Anderson turn showed `input_tokens=3` against `cache_read_input_tokens=3,040`).
+- Quota percentages are estimates from a reverse-engineered credit model, not account balances. `--usd` is SDK-reported usage, not an invoice. Cached prompt tokens are reported separately from `input_tokens` and must be counted **at their own rates** — `CACHE_READ_MULTIPLIER` (0.1) and `CACHE_WRITE_MULTIPLIER` (1.25), not 1.0. Anderson turns are cache-dominated (a real one showed `input_tokens=3` against `cache_read_input_tokens=3,040`), so counting cache reads at zero understates badly and counting them at full price overstates the dominant term.
+- `UsageStats` distinguishes `usage_observed` (an attempt happened) from `usage_available` (the provider returned numbers). `add()` is monotone on availability: one attempt without usage data makes the aggregate unavailable, and `_record_usage` then blanks the session's cumulative total rather than reporting a fabricated figure. Be aware this is all-or-nothing per session.
 - Timeouts are empirical: `SCOUT_TIMEOUT_S=720`, `ANDERSON_TIMEOUT_S=1200`. Both were raised after real production timeouts.
 
 ## Repository workflow
