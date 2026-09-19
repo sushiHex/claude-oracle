@@ -163,6 +163,7 @@ def test_extract_usage_attr_object():
 
     s = _extract_usage(M(), "haiku")
     assert s.input_tokens == 10 and s.output_tokens == 2
+    assert s.usage_available is True
 
 
 def test_extract_usage_dict():
@@ -188,6 +189,39 @@ def test_extract_usage_missing_usage():
 
     s = _extract_usage(M(), "haiku")
     assert s.input_tokens == 0 and s.output_tokens == 0
+    assert s.usage_observed is True and s.usage_available is False
+
+
+def test_extract_usage_includes_cache_token_fields():
+    class M:
+        usage = {
+            "input_tokens": 3,
+            "output_tokens": 4,
+            "cache_read_input_tokens": 5,
+            "cache_creation_input_tokens": 6,
+        }
+
+    s = _extract_usage(M(), "sonnet")
+    assert s.cache_read_input_tokens == 5
+    assert s.cache_creation_input_tokens == 6
+    assert s.total_tokens == 18
+    assert s.usage_available is True
+
+
+def test_progress_callback_reports_completed_work():
+    updates = []
+    oracle = OracleSDK(chains=1, progress_callback=updates.append)
+    oracle._progress_totals = {"scouts": 2, "organizers": 1}
+    oracle._active_scouts = {1: "done", 2: "running"}
+    oracle._completed_organizers = 1
+    oracle._emit_progress("organize")
+    assert updates[-1] == {
+        "phase": "organize",
+        "progress": {
+            "scouts": {"completed": 1, "total": 2},
+            "organizers": {"completed": 1, "total": 1},
+        },
+    }
 
 
 # --------------------------------------------------------------------------

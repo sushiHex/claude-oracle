@@ -116,13 +116,30 @@ Resuming uses the saved question, budget, and local-tool/cost-display settings. 
 
 Without supplied prompts, the first round can use the Architect. Without `--session-dir`, multiple rounds create a unique directory under `research/` and print its absolute path to stderr. `--session-dir` also enables persistence for a single round; ordinary one-round CLI calls remain unchanged.
 
+### Machine-readable handoff status
+
+`RoundSession.status()` keeps lifecycle state separate from research outcome. The
+`research_outcome` field is `unknown` while running, `complete` when all dispatched
+work succeeds, `partial` when a usable report includes failed or skipped work, and
+`failed` when the round cannot return research. Status also exposes `current_phase`,
+`progress`, `active_attempt`, `last_updated_at`, and `next_action`. Progress is
+updated as scouts and organizers finish, so `--session-status` can be polled
+while a round is running. These fields are runtime evidence, not a judgment
+about prose quality.
+
+The caller records editorial progress explicitly after revising the canonical
+report: `session.checkpoint(revision="git-or-content-revision", through_round=1)`.
+The round must already be complete; Oracle never advances this checkpoint or claims
+that it proves final-draft quality. Resume a failed attempt with a fresh plan and
+inspect the preserved attempt usage/artifact paths before retrying.
+
 ### Evolve one canonical report
 
 After launching each subsequent round, **strengthen the same `canonical.md` to final-draft quality while research runs**, using all completed findings. Integrate sources and corrections, reconcile contradictions, replace outdated claims, and improve the structure and argument. Each revision should stand as a coherent report with explicit uncertainties. Finish the revision even if the next round returns quickly.
 
 During round one, establish scope and known context without inventing research results. After the last round, make a final substantive revision incorporating its findings. Default to one canonical report throughout the session, including resumes; create additional canonical documents only when explicitly instructed. Raw round outputs are supporting evidence, not separate final reports.
 
-The runtime writes a scaffold once and then leaves the canonical report to the caller. It does not enforce editorial quality or determine when writing is complete. Deliver the report path, conclusions, unresolved questions, and total usage across rounds.
+The runtime writes a scaffold once and then leaves the canonical report to the caller. It does not enforce editorial quality or determine when writing is complete. Deliver the report path, conclusions, unresolved questions, and total usage across rounds. Usage fields are marked unavailable when the provider did not return token data; do not treat missing usage as zero.
 
 ### State and recovery
 

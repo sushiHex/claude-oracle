@@ -10,7 +10,46 @@ import tempfile
 
 
 DEFAULT_ROUNDS = 1
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+_OUTCOMES = {"complete", "partial", "failed", "unknown"}
+_USAGE_FIELDS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+    "cost_usd",
+    "quota_units",
+)
+
+
+def _empty_reported_usage() -> dict:
+    return {**{key: None for key in _USAGE_FIELDS}, "available": False}
+
+
+def _status_defaults(state: dict) -> dict:
+    """Apply v1-compatible defaults for the observable handoff contract."""
+    state.setdefault("research_outcome", "unknown")
+    state.setdefault("current_phase", "idle")
+    state.setdefault("progress", {"scouts": {"completed": 0, "total": 0}, "organizers": {"completed": 0, "total": 0}})
+    state.setdefault("active_attempt", None)
+    state.setdefault("last_updated_at", state.get("created_at", _now()))
+    state.setdefault("next_action", "Run the first research round")
+    state.setdefault("checkpoint", {"path": "canonical.md", "revision": None, "through_round": 0})
+    state.setdefault("artifact_paths", [])
+    usage = state.setdefault("reported_usage", _empty_reported_usage())
+    if not isinstance(usage, dict):
+        usage = _empty_reported_usage()
+        state["reported_usage"] = usage
+    usage.setdefault("available", False)
+    for key in _USAGE_FIELDS:
+        usage.setdefault(key, None)
+    if usage["available"] and any(usage[key] is None for key in _USAGE_FIELDS):
+        usage["available"] = False
+    if not usage["available"]:
+        for key in _USAGE_FIELDS:
+            usage[key] = None
+    return state
 
 
 def _positive_integer(value: int, label: str) -> int:
@@ -40,8 +79,8 @@ def _write_json(path: Path, value: dict | list) -> None:
 
 
 @contextmanager
-def _session_lock(path: Path):
-    """One round writer per session; the OS releases the lock after a crash."""
+def _file_lock(path: Path, *, blocking: bool, error_message: str | None = None):
+    """Lock one byte in a file; the OS releases the lock after a crash."""
     with path.open("a+b") as stream:
         stream.seek(0, os.SEEK_END)
         if stream.tell() == 0:
@@ -51,9 +90,12 @@ def _session_lock(path: Path):
         if os.name == "nt":
             import msvcrt
             try:
-                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+                mode = msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK
+                msvcrt.locking(stream.fileno(), mode, 1)
             except OSError as exc:
-                raise RuntimeError("This session already has a round running") from exc
+                if error_message is None:
+                    raise
+                raise RuntimeError(error_message) from exc
             try:
                 yield
             finally:
@@ -62,13 +104,34 @@ def _session_lock(path: Path):
         else:
             import fcntl
             try:
-                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                mode = fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
+                fcntl.flock(stream.fileno(), mode)
             except OSError as exc:
-                raise RuntimeError("This session already has a round running") from exc
+                if error_message is None:
+                    raise
+                raise RuntimeError(error_message) from exc
             try:
                 yield
             finally:
                 fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def _session_lock(path: Path):
+    """One round writer per session; the OS releases the lock after a crash."""
+    with _file_lock(
+        path,
+        blocking=False,
+        error_message="This session already has a round running",
+    ):
+        yield
+
+
+@contextmanager
+def _state_lock(path: Path):
+    """Serialize read-modify-write updates to session.json."""
+    with _file_lock(path, blocking=True):
+        yield
 
 
 class RoundSession:
@@ -123,6 +186,15 @@ class RoundSession:
         )
         _write_json(session.path / "session.json", {
             "schema_version": SCHEMA_VERSION,
+            "research_outcome": "unknown",
+            "current_phase": "idle",
+            "progress": {"scouts": {"completed": 0, "total": 0}, "organizers": {"completed": 0, "total": 0}},
+            "active_attempt": None,
+            "last_updated_at": _now(),
+            "next_action": "Run the first research round",
+            "checkpoint": {"path": "canonical.md", "revision": None, "through_round": 0},
+            "artifact_paths": [],
+            "reported_usage": _empty_reported_usage(),
             "question": question.strip(),
             "rounds": rounds,
             "chains": chains,
@@ -142,13 +214,13 @@ class RoundSession:
         session.status()
         return session
 
-    def status(self) -> dict:
-        """Read the latest atomic snapshot without waiting for a running round."""
+    def _read_state(self) -> dict:
         from .sdk import MAX_CHAINS
 
         state = json.loads((self.path / "session.json").read_text(encoding="utf-8"))
-        if not isinstance(state, dict) or state.get("schema_version") != SCHEMA_VERSION:
+        if not isinstance(state, dict) or state.get("schema_version") not in {1, SCHEMA_VERSION}:
             raise ValueError("Unsupported Oracle round session format")
+        state = _status_defaults(state)
         _positive_integer(state.get("rounds"), "Rounds")
         _positive_integer(state.get("chains"), "Chains")
         completed = state.get("completed_rounds")
@@ -164,9 +236,99 @@ class RoundSession:
             }
             or not isinstance(state.get("local_tools"), bool)
             or not isinstance(state.get("show_dollars"), bool)
+            or state.get("research_outcome") not in _OUTCOMES
+            or not isinstance(state.get("progress"), dict)
+            or not isinstance(state.get("checkpoint"), dict)
+            or not isinstance(state["checkpoint"].get("through_round"), int)
+            or not 0 <= state["checkpoint"]["through_round"] <= completed
+            or not isinstance(state.get("artifact_paths"), list)
+            or not isinstance(state.get("reported_usage"), dict)
         ):
             raise ValueError("Invalid Oracle round session state")
         return state
+
+    def _persist_state(self, state: dict) -> None:
+        """Write state while preserving a checkpoint recorded by another process."""
+        state["schema_version"] = SCHEMA_VERSION
+        with _state_lock(self.path / ".session.lock"):
+            latest = self._read_state()
+            state["checkpoint"] = latest["checkpoint"]
+            _write_json(self.path / "session.json", state)
+
+    @staticmethod
+    def _artifact_paths(base: Path, existing: list, current: Path) -> list[str]:
+        """Keep session artifacts relative and retain previous rounds."""
+        paths: list[str] = []
+        for raw in existing:
+            if not isinstance(raw, str):
+                continue
+            path = Path(raw)
+            if path.is_absolute():
+                try:
+                    path = path.relative_to(base)
+                except ValueError:
+                    continue
+            normalized = path.as_posix()
+            if normalized not in paths:
+                paths.append(normalized)
+        for name in ("prompts.json", "report.md", "metrics.json"):
+            path = (current / name).relative_to(base).as_posix()
+            if path not in paths:
+                paths.append(path)
+        return paths
+
+    @staticmethod
+    def _usage_snapshot(usage) -> dict:
+        if not getattr(usage, "usage_observed", False) or not getattr(usage, "usage_available", False):
+            return _empty_reported_usage()
+        return {
+            **{key: getattr(usage, key, None) for key in _USAGE_FIELDS},
+            "available": True,
+        }
+
+    @staticmethod
+    def _record_usage(state: dict, usage, had_prior_attempts: bool) -> dict:
+        snapshot = RoundSession._usage_snapshot(usage)
+        reported = state["reported_usage"]
+        if not snapshot["available"]:
+            state["reported_usage"] = _empty_reported_usage()
+            return state["reported_usage"]
+        if not had_prior_attempts and not reported.get("available", False):
+            state["reported_usage"] = snapshot
+            return snapshot
+        if not reported.get("available", False):
+            state["reported_usage"] = _empty_reported_usage()
+            return state["reported_usage"]
+        for key in _USAGE_FIELDS:
+            reported[key] += snapshot[key]
+        reported["available"] = True
+        return reported
+
+    @staticmethod
+    def _research_outcome(metrics) -> str:
+        if metrics.scout_count and metrics.scout_errors >= metrics.scout_count:
+            return "failed"
+        if metrics.scout_errors or metrics.compressor_errors:
+            return "partial"
+        return "complete"
+
+    def status(self) -> dict:
+        """Read the latest atomic snapshot without waiting for a running round."""
+        return self._read_state()
+
+    def checkpoint(self, *, revision: str, through_round: int, path: str = "canonical.md") -> dict:
+        """Record the caller's editorial checkpoint; never advances automatically."""
+        if not isinstance(revision, str) or not revision.strip():
+            raise ValueError("Checkpoint revision is required")
+        with _state_lock(self.path / ".session.lock"):
+            state = self._read_state()
+            if not isinstance(through_round, int) or not 0 <= through_round <= state["completed_rounds"]:
+                raise ValueError("Checkpoint round must be between zero and completed rounds")
+            state["checkpoint"] = {"path": path, "revision": revision, "through_round": through_round}
+            state["last_updated_at"] = _now()
+            state["schema_version"] = SCHEMA_VERSION
+            _write_json(self.path / "session.json", state)
+            return state["checkpoint"]
 
     async def run_round(self, prompts: list[dict] | None = None, *, verbose: bool = False) -> str:
         """Execute one research round; later rounds require the caller's new plan.
@@ -180,6 +342,7 @@ class RoundSession:
         with _session_lock(self.path / ".round.lock"):
             state = self.status()
             number = state["completed_rounds"] + 1
+            had_prior_attempts = bool(state["attempts"])
             if number > state["rounds"]:
                 raise ValueError("All requested rounds have already finished")
             if prompts is None and (number > 1 or state["attempts"]):
@@ -216,10 +379,24 @@ class RoundSession:
             }
             state["attempts"].append(attempt)
             state["status"] = "running"
-            _write_json(self.path / "session.json", state)
+            state["research_outcome"] = "unknown"
+            state["current_phase"] = "research"
+            state["active_attempt"] = relative.as_posix()
+            state["progress"] = {"scouts": {"completed": 0, "total": len(prompts or [])}, "organizers": {"completed": 0, "total": len({p["chain"] for p in prompts or []})}}
+            state["last_updated_at"] = _now()
+            state["next_action"] = "Wait for research results"
+
+            def on_progress(update: dict) -> None:
+                state["current_phase"] = update["phase"]
+                state["progress"] = update["progress"]
+                state["last_updated_at"] = _now()
+                self._persist_state(state)
+
+            self._persist_state(state)
             oracle = OracleSDK(
                 chains=state["chains"], verbose=verbose,
                 local_tools=state["local_tools"], show_dollars=state["show_dollars"],
+                progress_callback=on_progress,
             )
             oracle.status(f"Round {number}/{state['rounds']} | session: {self.path}")
             oracle.status(f"Canonical report: {self.path / 'canonical.md'} (maintained by caller)")
@@ -236,16 +413,52 @@ class RoundSession:
                 attempt.update(status="completed", finished_at=_now())
                 state["completed_rounds"] = number
                 state["status"] = "rounds_complete" if number == state["rounds"] else "awaiting_plan"
-                _write_json(self.path / "session.json", state)
+                state["research_outcome"] = self._research_outcome(oracle.metrics)
+                state["current_phase"] = "complete"
+                state["active_attempt"] = None
+                state["progress"] = {"scouts": {"completed": oracle.metrics.scout_count, "total": oracle.scouts_total}, "organizers": {"completed": oracle.metrics.compressor_count, "total": oracle.metrics.chain_count}}
+                state["reported_usage"] = self._record_usage(
+                    state, oracle.metrics.total_usage, had_prior_attempts
+                )
+                attempt["usage"] = self._usage_snapshot(oracle.metrics.total_usage)
+                state["artifact_paths"] = self._artifact_paths(
+                    self.path, state.get("artifact_paths", []), self.path / relative
+                )
+                state["last_updated_at"] = _now()
+                state["next_action"] = "Revise canonical.md and record a checkpoint" if state["status"] == "rounds_complete" else "Prepare a fresh plan for the next round"
+                self._persist_state(state)
             except BaseException as exc:
-                attempt.update(status="failed", error=str(exc) or type(exc).__name__, finished_at=_now())
+                attempt.update(
+                    status="failed",
+                    error=str(exc) or type(exc).__name__,
+                    finished_at=_now(),
+                    usage=self._usage_snapshot(oracle.metrics.total_usage),
+                )
+                state["reported_usage"] = self._record_usage(
+                    state, oracle.metrics.total_usage, had_prior_attempts
+                )
                 state["completed_rounds"] = number - 1
                 state["status"] = "failed"
+                state["research_outcome"] = "failed"
+                state["current_phase"] = "failed"
+                state["active_attempt"] = None
+                state["progress"] = {
+                    "scouts": {
+                        "completed": min(oracle.metrics.scout_count, oracle.scouts_total),
+                        "total": oracle.scouts_total,
+                    },
+                    "organizers": {
+                        "completed": min(oracle.metrics.compressor_count, oracle.metrics.chain_count),
+                        "total": oracle.metrics.chain_count,
+                    },
+                }
+                state["last_updated_at"] = _now()
+                state["next_action"] = "Retry the failed round with a fresh plan"
                 # Keep the original failure if recording it also fails (e.g. disk full).
                 try:
                     if oracle.planned_prompts:
                         _write_json(folder / "prompts.json", oracle.planned_prompts)
-                    _write_json(self.path / "session.json", state)
+                    self._persist_state(state)
                 except OSError:
                     pass
                 raise

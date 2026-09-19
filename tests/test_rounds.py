@@ -54,6 +54,80 @@ def test_round_budget_rejected_before_creating_files(value):
     assert not Path("session").exists()
 
 
+def test_checkpoint_is_caller_controlled_and_validated():
+    session = RoundSession.create("question")
+    with pytest.raises(ValueError, match="between zero"):
+        session.checkpoint(revision="r1", through_round=1)
+    assert session.checkpoint(revision="draft-r0", through_round=0)["through_round"] == 0
+    assert session.status()["checkpoint"]["revision"] == "draft-r0"
+
+
+def test_checkpoint_during_round_survives_terminal_write(monkeypatch):
+    session = RoundSession.create("question")
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def slow_run(self, question, prompts=None):
+        started.set()
+        await release.wait()
+        return "Completed evidence"
+
+    monkeypatch.setattr(sdk.OracleSDK, "run", slow_run)
+
+    async def scenario():
+        task = asyncio.create_task(session.run_round(plan()))
+        await started.wait()
+        assert session.checkpoint(revision="during-round", through_round=0)["revision"] == "during-round"
+        release.set()
+        await task
+
+    asyncio.run(scenario())
+    state = session.status()
+    assert state["completed_rounds"] == 1
+    assert state["checkpoint"]["revision"] == "during-round"
+
+
+def test_running_round_persists_live_progress(monkeypatch):
+    session = RoundSession.create("question")
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def slow_run(self, question, prompts=None):
+        started.set()
+        self.progress_callback({
+            "phase": "research",
+            "progress": {
+                "scouts": {"completed": 3, "total": 10},
+                "organizers": {"completed": 0, "total": 1},
+            },
+        })
+        await release.wait()
+        return "Completed evidence"
+
+    monkeypatch.setattr(sdk.OracleSDK, "run", slow_run)
+
+    async def scenario():
+        task = asyncio.create_task(session.run_round(plan()))
+        await started.wait()
+        await asyncio.sleep(0)
+        assert session.status()["progress"]["scouts"]["completed"] == 3
+        release.set()
+        await task
+
+    asyncio.run(scenario())
+
+
+def test_status_exposes_compatible_defaults_for_v1_state():
+    session = RoundSession.create("question")
+    state = session.status()
+    state["schema_version"] = 1
+    (session.path / "session.json").write_text(json.dumps(state), encoding="utf-8")
+    restored = RoundSession.open(session.path).status()
+    assert restored["research_outcome"] == "unknown"
+    assert restored["checkpoint"]["through_round"] == 0
+    session = RoundSession.open(session.path)
+    session.checkpoint(revision="upgrade", through_round=0)
+    assert json.loads((session.path / "session.json").read_text())["schema_version"] == 2
+
+
 def test_default_session_and_existing_directory_are_preserved():
     session = RoundSession.create("question", directory="session")
     report = session.path / "canonical.md"
@@ -76,6 +150,8 @@ def test_resume_uses_new_plan_saved_settings_and_immutable_history(calls):
     assert state["completed_rounds"] == 1
     assert state["status"] == "awaiting_plan"
     assert json.loads(saved_files["metrics.json"])["scout_count"] == 10
+    assert state["reported_usage"]["available"] is False
+    assert state["reported_usage"]["input_tokens"] is None
     assert saved_files["report.md"].decode("utf-8") == first
     canonical.write_text("Final-draft-quality revision with sources", encoding="utf-8")
 
@@ -91,6 +167,8 @@ def test_resume_uses_new_plan_saved_settings_and_immutable_history(calls):
     assert calls[1]["oracle"].show_dollars is True
     assert calls[1]["oracle"].chains == 2
     assert canonical.read_text() == "Final-draft-quality revision with sources"
+    assert len(reopened.status()["artifact_paths"]) == 6
+    assert all(not Path(path).is_absolute() for path in reopened.status()["artifact_paths"])
     assert {p.name: p.read_bytes() for p in first_folder.iterdir()} == saved_files
     with pytest.raises(ValueError, match="already finished"):
         asyncio.run(reopened.run_round(plan()))
@@ -131,6 +209,62 @@ def test_failed_attempt_is_preserved_and_retry_does_not_consume_round(monkeypatc
     assert [a["status"] for a in state["attempts"]] == ["failed", "completed"]
     assert state["attempts"][0]["error"] == "transport disconnected"
     assert all((session.path / a["directory"] / "prompts.json").exists() for a in state["attempts"])
+
+
+@pytest.mark.parametrize("errors, expected", [
+    ((0, 0), "complete"),
+    ((1, 0), "partial"),
+])
+def test_completed_round_derives_research_outcome(monkeypatch, errors, expected):
+    session = RoundSession.create("question")
+
+    async def fake_run(self, question, prompts=None):
+        self.metrics = sdk.OracleMetrics(
+            start_time=time.time(),
+            scout_count=10,
+            scout_errors=errors[0],
+            compressor_count=1,
+            compressor_errors=errors[1],
+            chain_count=1,
+        )
+        return "Returned report"
+
+    monkeypatch.setattr(sdk.OracleSDK, "run", fake_run)
+    asyncio.run(session.run_round(plan()))
+    assert session.status()["research_outcome"] == expected
+
+
+def test_all_scouts_failed_is_a_failed_outcome(monkeypatch):
+    session = RoundSession.create("question")
+
+    async def fake_run(self, question, prompts=None):
+        self.metrics = sdk.OracleMetrics(
+            start_time=time.time(), scout_count=10, scout_errors=10, chain_count=1
+        )
+        return "ERROR: All Smiths failed"
+
+    monkeypatch.setattr(sdk.OracleSDK, "run", fake_run)
+    asyncio.run(session.run_round(plan()))
+    assert session.status()["research_outcome"] == "failed"
+
+
+def test_failed_round_preserves_observed_progress(monkeypatch):
+    session = RoundSession.create("question")
+
+    async def fake_run(self, question, prompts=None):
+        self.metrics = sdk.OracleMetrics(
+            start_time=time.time(), scout_count=3, compressor_count=1, chain_count=1
+        )
+        raise RuntimeError("transport disconnected")
+
+    monkeypatch.setattr(sdk.OracleSDK, "run", fake_run)
+    with pytest.raises(RuntimeError, match="transport disconnected"):
+        asyncio.run(session.run_round(plan()))
+    progress = session.status()["progress"]
+    assert progress == {
+        "scouts": {"completed": 3, "total": 10},
+        "organizers": {"completed": 1, "total": 1},
+    }
 
 
 def test_running_round_allows_status_and_report_edits_but_rejects_second_writer(monkeypatch):
@@ -282,3 +416,11 @@ def test_cli_resume_requires_plan_and_rejects_configuration_overrides(monkeypatc
         cli(monkeypatch, ["--resume", "session", *args], plan() if args else None)
     assert exc.value.code == 2
     assert calls == []
+
+
+def test_cli_help_describes_live_session_status(monkeypatch, capsys):
+    monkeypatch.setattr(sdk.sys, "argv", ["claude-oracle", "--help"])
+    with pytest.raises(SystemExit) as exc:
+        asyncio.run(sdk._async_main())
+    assert exc.value.code == 0
+    assert "live phase/progress" in capsys.readouterr().out

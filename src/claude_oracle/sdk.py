@@ -261,18 +261,42 @@ def _github_mcp() -> dict | None:
 class UsageStats:
     input_tokens: int = 0
     output_tokens: int = 0
+    cache_read_input_tokens: int = 0
+    cache_creation_input_tokens: int = 0
     cost_usd: float = 0.0
     quota_units: float = 0.0
+    usage_observed: bool = False
+    usage_available: bool = False
 
     def add(self, other: "UsageStats"):
+        if not other.usage_observed:
+            return
+        if not self.usage_observed:
+            self.input_tokens = other.input_tokens
+            self.output_tokens = other.output_tokens
+            self.cache_read_input_tokens = other.cache_read_input_tokens
+            self.cache_creation_input_tokens = other.cache_creation_input_tokens
+            self.cost_usd = other.cost_usd
+            self.quota_units = other.quota_units
+            self.usage_observed = True
+            self.usage_available = other.usage_available
+            return
         self.input_tokens += other.input_tokens
         self.output_tokens += other.output_tokens
+        self.cache_read_input_tokens += other.cache_read_input_tokens
+        self.cache_creation_input_tokens += other.cache_creation_input_tokens
         self.cost_usd += other.cost_usd
         self.quota_units += other.quota_units
+        self.usage_available = self.usage_available and other.usage_available
 
     @property
     def total_tokens(self) -> int:
-        return self.input_tokens + self.output_tokens
+        return (
+            self.input_tokens
+            + self.output_tokens
+            + self.cache_read_input_tokens
+            + self.cache_creation_input_tokens
+        )
 
     @property
     def session_pct(self) -> float:
@@ -283,7 +307,14 @@ class UsageStats:
         return (self.quota_units / WEEKLY_CREDITS) * 100 if WEEKLY_CREDITS else 0
 
     def __str__(self) -> str:
+        if self.usage_observed and not self.usage_available:
+            return "usage unavailable"
         return f"{self.total_tokens:,} tok ({self.weekly_pct:.2f}% weekly)"
+
+
+def _unknown_usage() -> UsageStats:
+    """Represent a model attempt whose provider did not return usage data."""
+    return UsageStats(usage_observed=True)
 
 
 @dataclass
@@ -294,7 +325,7 @@ class ScoutResult:
     result_text: str
     error: str | None = None
     duration_ms: int = 0
-    usage: UsageStats = field(default_factory=UsageStats)
+    usage: UsageStats = field(default_factory=_unknown_usage)
 
 
 @dataclass
@@ -303,7 +334,7 @@ class CompressorResult:
     summary: str
     error: str | None = None
     duration_ms: int = 0
-    usage: UsageStats = field(default_factory=UsageStats)
+    usage: UsageStats = field(default_factory=_unknown_usage)
     # When Anderson fails (timeout / exception), the orchestrator stashes the
     # raw scout outputs here so the report can fall back to them instead of
     # discarding 10 Smiths' worth of work. Recovery becomes "redo Anderson",
@@ -344,21 +375,33 @@ class OracleMetrics:
 
 def _extract_usage(message, model: str = MODEL_SONNET) -> UsageStats:
     """Extract usage stats and compute quota units based on model weight."""
-    stats = UsageStats()
+    stats = _unknown_usage()
     if hasattr(message, "total_cost_usd") and message.total_cost_usd is not None:
         stats.cost_usd = message.total_cost_usd
     if hasattr(message, "usage") and message.usage is not None:
         usage = message.usage
-        if hasattr(usage, "input_tokens"):
-            stats.input_tokens = usage.input_tokens or 0
-        elif isinstance(usage, dict):
-            stats.input_tokens = usage.get("input_tokens") or 0
-        if hasattr(usage, "output_tokens"):
-            stats.output_tokens = usage.output_tokens or 0
-        elif isinstance(usage, dict):
-            stats.output_tokens = usage.get("output_tokens") or 0
+        fields = (
+            "input_tokens",
+            "output_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+        )
+        values = {}
+        for field_name in fields:
+            if hasattr(usage, field_name):
+                values[field_name] = getattr(usage, field_name)
+            elif isinstance(usage, dict):
+                values[field_name] = usage.get(field_name)
+        stats.usage_available = any(value is not None for value in values.values())
+        for field_name, value in values.items():
+            setattr(stats, field_name, value or 0)
     weight = MODEL_WEIGHTS.get(model, 1.0)
-    stats.quota_units = (stats.input_tokens + stats.output_tokens * OUTPUT_MULTIPLIER) * weight
+    stats.quota_units = (
+        stats.input_tokens
+        + stats.cache_read_input_tokens
+        + stats.cache_creation_input_tokens
+        + stats.output_tokens * OUTPUT_MULTIPLIER
+    ) * weight
     return stats
 
 
@@ -372,6 +415,7 @@ class OracleSDK:
         verbose: bool = False,
         show_dollars: bool = False,
         local_tools: bool = False,
+        progress_callback=None,
     ):
         if chains < 1 or chains > MAX_CHAINS:
             raise ValueError(f"Chains must be 1-{MAX_CHAINS}, got {chains}")
@@ -387,7 +431,10 @@ class OracleSDK:
         self.local_tools = local_tools
         self.metrics = OracleMetrics()
         self.planned_prompts: list[dict] = []
+        self.progress_callback = progress_callback
         self._active_scouts: dict[int, str] = {}  # scout_id -> status
+        self._progress_totals = {"scouts": self.scouts_total, "organizers": self.chains}
+        self._completed_organizers = 0
         self._has_architect = False  # set when Architect phase runs
         self._iso_root: str | None = None  # per-run base dir for isolated configs
 
@@ -403,6 +450,29 @@ class OracleSDK:
         """Count scouts not yet in a terminal state (single source for the
         'N left' progress line, so the success and timeout paths agree)."""
         return sum(1 for s in self._active_scouts.values() if s not in ("done", "error", "timeout"))
+
+    def _emit_progress(self, phase: str) -> None:
+        """Publish best-effort live progress without affecting model work."""
+        if self.progress_callback is None:
+            return
+        terminal = {"done", "error", "timeout"}
+        update = {
+            "phase": phase,
+            "progress": {
+                "scouts": {
+                    "completed": sum(status in terminal for status in self._active_scouts.values()),
+                    "total": self._progress_totals["scouts"],
+                },
+                "organizers": {
+                    "completed": self._completed_organizers,
+                    "total": self._progress_totals["organizers"],
+                },
+            },
+        }
+        try:
+            self.progress_callback(update)
+        except Exception as exc:
+            self.log(f"  progress update unavailable: {exc}")
 
     def _phase(self, name: str) -> str:
         """Return 'Phase N/T -- name' with correct numbering."""
@@ -474,7 +544,7 @@ Return ONLY a JSON array:
 {{"chain": "A", "id": 1, "dimension": "short label", "prompt": "text"}}"""
 
         result_text = ""
-        usage = UsageStats()
+        usage = _unknown_usage()
         try:
             gen = query(
                 prompt=prompt,
@@ -516,7 +586,7 @@ Return ONLY a JSON array:
         self._active_scouts[scout_id] = "running"
         try:
             result_text = ""
-            usage = UsageStats()
+            usage = _unknown_usage()
             last_tool = ""
             # Build MCP config if GitHub PAT is available
             tools = ["WebSearch", "WebFetch"]
@@ -575,6 +645,7 @@ GitHub MCP tools available — prefer these over WebSearch for repo data:
             # would pass the all-fail guard and contribute nothing to Anderson.
             if not result_text.strip():
                 self._active_scouts[scout_id] = "error"
+                self._emit_progress("research")
                 elapsed = time.time() - t0
                 self.status(f"  Smith #{scout_id} ({chain}/{dimension}) returned EMPTY [{elapsed:.1f}s]")
                 return ScoutResult(
@@ -588,6 +659,7 @@ GitHub MCP tools available — prefer these over WebSearch for repo data:
                 )
 
             self._active_scouts[scout_id] = "done"
+            self._emit_progress("research")
             remaining = self._scouts_remaining()
             elapsed = time.time() - t0
             chain_prefix = f"{chain}/" if self.chains > 1 else ""
@@ -603,6 +675,7 @@ GitHub MCP tools available — prefer these over WebSearch for repo data:
             )
         except Exception as e:
             self._active_scouts[scout_id] = "error"
+            self._emit_progress("research")
             self.status(f"  Smith #{scout_id} FAILED ({chain}/{dimension}): {e}")
             return ScoutResult(
                 scout_id=scout_id,
@@ -626,6 +699,7 @@ GitHub MCP tools available — prefer these over WebSearch for repo data:
         self.status(f"{self._phase('smiths')}Smiths ({self.scouts_total} Haiku, parallel; {mode})")
         t0 = time.time()
         self._active_scouts = {}
+        self._emit_progress("research")
         loop = asyncio.get_running_loop()
 
         async def _scout_with_timeout(p: dict) -> ScoutResult:
@@ -649,6 +723,7 @@ GitHub MCP tools available — prefer these over WebSearch for repo data:
                 )
             except asyncio.TimeoutError:
                 self._active_scouts[p["id"]] = "timeout"
+                self._emit_progress("research")
                 remaining = self._scouts_remaining()
                 self.status(f"  Smith #{p['id']} ({p['dimension']}) TIMEOUT [{SCOUT_TIMEOUT_S}s, {remaining} left]")
                 return ScoutResult(
@@ -662,6 +737,7 @@ GitHub MCP tools available — prefer these over WebSearch for repo data:
             except Exception as e:
                 sid = p.get("id", -1)
                 self._active_scouts[sid] = "error"
+                self._emit_progress("research")
                 self.status(f"  Smith #{sid} FAILED (dispatch): {e}")
                 return ScoutResult(
                     scout_id=sid,
@@ -699,6 +775,7 @@ GitHub MCP tools available — prefer these over WebSearch for repo data:
                     )
                 except asyncio.TimeoutError:
                     self._active_scouts[p["id"]] = "timeout"
+                    self._emit_progress("research")
                     retry = ScoutResult(
                         scout_id=p["id"], chain=p["chain"], dimension=p["dimension"],
                         result_text="", error=f"Timed out after {SCOUT_TIMEOUT_S}s (retry)",
@@ -706,6 +783,7 @@ GitHub MCP tools available — prefer these over WebSearch for repo data:
                     )
                 except Exception as e:
                     self._active_scouts[p["id"]] = "error"
+                    self._emit_progress("research")
                     retry = ScoutResult(
                         scout_id=p["id"], chain=p["chain"], dimension=p["dimension"],
                         result_text="", error=f"{e} (retry)",
@@ -778,7 +856,7 @@ Organize, don't compress — the calling session will do the editorial judgment.
 
         try:
             result_text = ""
-            usage = UsageStats()
+            usage = _unknown_usage()
             anderson_opts = {
                 "model": MODEL_SONNET,
                 "allowed_tools": ["Read", "Grep", "Glob"],
@@ -823,6 +901,7 @@ Organize, don't compress — the calling session will do the editorial judgment.
         else:
             self.status(f"{self._phase('anderson')}Anderson ({self.chains} parallel Sonnet)")
         t0 = time.time()
+        self._emit_progress("organize")
 
         # Group scouts by chain
         chains: dict[str, list[ScoutResult]] = {}
@@ -833,17 +912,26 @@ Organize, don't compress — the calling session will do the editorial judgment.
             if delay > 0:
                 await asyncio.sleep(delay)
             try:
-                return await asyncio.wait_for(
+                result = await asyncio.wait_for(
                     self._run_compressor(chain, scouts),
                     timeout=ANDERSON_TIMEOUT_S,
                 )
+                self._completed_organizers += 1
+                self._emit_progress("organize")
+                return result
             except asyncio.TimeoutError:
                 self.status(f"  Anderson {chain} TIMEOUT [{ANDERSON_TIMEOUT_S}s] — stashing raw Smiths as fallback")
-                return CompressorResult(chain=chain, summary="", error=f"Timed out after {ANDERSON_TIMEOUT_S}s",
-                                        duration_ms=ANDERSON_TIMEOUT_S * 1000, fallback_scouts=scouts)
+                result = CompressorResult(chain=chain, summary="", error=f"Timed out after {ANDERSON_TIMEOUT_S}s",
+                                          duration_ms=ANDERSON_TIMEOUT_S * 1000, fallback_scouts=scouts)
+                self._completed_organizers += 1
+                self._emit_progress("organize")
+                return result
             except Exception as e:
                 self.status(f"  Anderson {chain} FAILED: {e} — stashing raw Smiths as fallback")
-                return CompressorResult(chain=chain, summary="", error=str(e), fallback_scouts=scouts)
+                result = CompressorResult(chain=chain, summary="", error=str(e), fallback_scouts=scouts)
+                self._completed_organizers += 1
+                self._emit_progress("organize")
+                return result
 
         # Dispatch only chains with at least one successful Smith. Multi-chain:
         # reverse-sort so Chain A (usually heaviest) launches LAST with the most
@@ -862,6 +950,8 @@ Organize, don't compress — the calling session will do the editorial judgment.
                     chain=chain, summary="",
                     error="All Smiths failed for this chain — Anderson skipped",
                 ))
+                self._completed_organizers += 1
+                self._emit_progress("organize")
                 continue
             delay = 0 if isolated else ((3 + dispatched * 2) if multi else 0)
             tasks.append(_compress_with_timeout(chain, scouts, delay=delay))
@@ -898,6 +988,7 @@ Organize, don't compress — the calling session will do the editorial judgment.
     async def _run_inner(self, question: str, prompts: list[dict] | None = None) -> str:
         self.metrics = OracleMetrics(start_time=time.time())
         self.planned_prompts = []
+        self._completed_organizers = 0
 
         if prompts:
             # Normalize (idempotent) and validate library-supplied prompts, so the
@@ -912,6 +1003,11 @@ Organize, don't compress — the calling session will do the editorial judgment.
             prompts = await self.decompose(question)
 
         self.planned_prompts = prompts
+        self._progress_totals = {
+            "scouts": len(prompts),
+            "organizers": len({p["chain"] for p in prompts}),
+        }
+        self._emit_progress("research")
         # Phase 2: Scout (all parallel, bounded)
         scout_results = await self.scout(prompts)
 
@@ -1013,7 +1109,8 @@ async def _async_main():
     session_options.add_argument("--resume", metavar="SESSION",
         help="Run the next round of a saved session with fresh JSON prompts on stdin")
     session_options.add_argument("--session-status", metavar="SESSION",
-        help="Print a session's progress as JSON without running models or reading stdin")
+        help="Print lifecycle, outcome, live phase/progress, checkpoint, and usage as JSON "
+             "without running models or reading stdin")
     parser.add_argument("--verbose", "-v", action="store_true", help="Show tool activity per scout")
     parser.add_argument("--local", action="store_true",
         help="Grant scouts local file tools (Read/Grep/Glob) for questions about "
