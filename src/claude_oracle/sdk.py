@@ -73,8 +73,13 @@ MODEL_SONNET = "sonnet"
 MODEL_OPUS = "opus"
 
 # Max 20x credit system (source: oreateai.com reverse-engineering, ~Mar 2026)
-# Credits = (input_tokens * model_weight) + (output_tokens * model_weight * 5)
-# Output costs 5x input. Model weights: Haiku=0.2, Sonnet=1.0, Opus=1.67
+# Credits = (billable_input + output_tokens * 5) * model_weight, where
+#   billable_input = input_tokens
+#                  + cache_read_input_tokens * 0.1
+#                  + cache_creation_input_tokens * 1.25
+# Output costs 5x input; cached reads are discounted and cache writes carry a
+# premium (Anthropic's published API cache pricing, 5-minute default TTL).
+# Model weights: Haiku=0.2, Sonnet=1.0, Opus=1.67.
 # Anthropic can change these at any time — treat as approximate.
 SESSION_CREDITS = 11_000_000    # Max 20x 5-hour session
 WEEKLY_CREDITS = 83_330_000     # Max 20x 7-day rolling
@@ -887,7 +892,7 @@ Organize, don't compress — the calling session will do the editorial judgment.
                 # rejection, and error correction. `high` emitted 3.1x the
                 # tokens for identical output — it pads rather than preserving
                 # more signal, which contradicts the "organize, don't compress"
-                # mandate below.
+                # mandate in the prompt above.
                 "effort": "low",
                 "allowed_tools": ["Read", "Grep", "Glob"],
                 "system_prompt": "You are Anderson. Organize Smith reports into structured findings. Preserve all unique signal — the calling session handles final synthesis.",
