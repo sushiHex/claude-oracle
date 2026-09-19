@@ -234,6 +234,34 @@ def test_completed_round_derives_research_outcome(monkeypatch, errors, expected)
     assert session.status()["research_outcome"] == expected
 
 
+def test_round_metrics_and_reported_usage_persist_cache_fields(monkeypatch):
+    """Cache tokens are most of an organizer's billable input, so they have to
+    survive into both the round's metrics file and the session's running total."""
+    session = RoundSession.create("question")
+
+    async def fake_run(self, question, prompts=None):
+        self.metrics = sdk.OracleMetrics(start_time=time.time(), scout_count=10, chain_count=1)
+        self.metrics.phase_usage["scout"] = sdk.UsageStats(
+            input_tokens=10, output_tokens=20,
+            cache_read_input_tokens=30, cache_creation_input_tokens=40,
+            quota_units=123.5, usage_observed=True, usage_available=True,
+        )
+        return "Findings"
+
+    monkeypatch.setattr(sdk.OracleSDK, "run", fake_run)
+    asyncio.run(session.run_round(plan()))
+
+    metrics_file = session.path / "rounds" / "round-001-attempt-001" / "metrics.json"
+    total = json.loads(metrics_file.read_text(encoding="utf-8"))["total_usage"]
+    assert total["cache_read_input_tokens"] == 30
+    assert total["cache_creation_input_tokens"] == 40
+
+    reported = session.status()["reported_usage"]
+    assert reported["available"] is True
+    assert reported["cache_read_input_tokens"] == 30
+    assert reported["quota_units"] == 123.5
+
+
 def test_all_scouts_failed_is_a_failed_outcome(monkeypatch):
     session = RoundSession.create("question")
 

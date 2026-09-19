@@ -1,5 +1,5 @@
 """
-Oracle SDK v4.7.0 — Multi-tier research orchestrator (Claude Agent SDK).
+Oracle SDK — Multi-tier research orchestrator (Claude Agent SDK).
 
   Phase 1: Smiths (N*10 parallel Haiku) -> web tools (WebSearch, WebFetch, optional
            GitHub MCP); local file tools (Read/Grep/Glob) only with --local
@@ -43,6 +43,12 @@ if sys.platform == "win32":
 # Auto-clear CLAUDECODE env var so SDK can launch from inside a CC session
 if "CLAUDECODE" in os.environ:
     del os.environ["CLAUDECODE"]
+
+# The one version string in the codebase. `pyproject.toml` reads it through
+# setuptools' dynamic `attr =` (a plain literal, so it is parsed statically, not
+# imported), and the CLI banner formats it below — so a release bumps this and
+# the packaged SKILL.md header, and nothing else can drift out of step.
+__version__ = "4.8.0"
 
 # ---------------------------------------------------------------------------
 # Defaults
@@ -563,10 +569,12 @@ Return ONLY a JSON array:
                 prompt=prompt,
                 options=ClaudeAgentOptions(
                     model=MODEL_SONNET,
-                    # Decomposition is mechanical JSON emission. Benchmarked
-                    # low/medium/high at 24 prompts across 3 chains: all passed
-                    # 100% (count, chain balance, distinct dimensions), so the
-                    # default `high` bought nothing for 1.7x the tokens.
+                    # Decomposition is mechanical JSON emission, so effort buys
+                    # nothing here. Method: sweep low/medium/high over a fixed
+                    # question, scoring prompt count, chain balance, and distinct
+                    # dimensions, against tokens spent. Every level scored the
+                    # same; higher effort only cost more. Re-run that sweep
+                    # before raising this.
                     effort="low",
                     allowed_tools=["Read", "Grep", "Glob"],
                     system_prompt="Decompose research questions into orthogonal sub-prompts. Output ONLY valid JSON.",
@@ -615,10 +623,12 @@ Return ONLY a JSON array:
                 "model": MODEL_HAIKU,
                 "allowed_tools": tools,
                 "disallowed_tools": ["Bash", "Write", "Edit", "NotebookEdit", "Agent"],
-                # Scouting is search-and-report, not multi-step reasoning, so the
-                # thinking budget bought nothing: benchmarked -26% output tokens
-                # with citation breadth unchanged (12.4 -> 13.6 domains) and zero
-                # empty results across 5 runs.
+                # Scouting is search-and-report, not multi-step reasoning, so a
+                # thinking budget buys nothing. Method: repeat one scout prompt
+                # with thinking on and off, comparing distinct cited domains and
+                # empty-result rate against output tokens. Citation breadth held
+                # while output tokens fell materially. Re-run that comparison
+                # before re-enabling.
                 "thinking": {"type": "disabled"},
                 # Runaway guard only. Observed working range is 9-23 turns, so
                 # this never binds on a healthy Smith — do not lower below 25.
@@ -885,14 +895,15 @@ Organize, don't compress — the calling session will do the editorial judgment.
             usage = _unknown_usage()
             anderson_opts = {
                 "model": MODEL_SONNET,
-                # Biggest single saving in the pipeline (~50% of run spend).
-                # Benchmarked at production scale (10 reports x 8K chars) with
-                # planted adversarial items: low/medium/high all scored 100% on
-                # marker recall, contradiction detection, stale-vs-fresh
-                # rejection, and error correction. `high` emitted 3.1x the
-                # tokens for identical output — it pads rather than preserving
-                # more signal, which contradicts the "organize, don't compress"
-                # mandate in the prompt above.
+                # Anderson is the largest single line item in a run, so this is
+                # the most consequential effort setting in the pipeline. Method:
+                # sweep low/medium/high over a full-size chain whose reports
+                # carry planted markers, contradictions, stale-vs-fresh pairs,
+                # and seeded errors, scoring recall of each against tokens
+                # spent. Every level recovered the same items; higher effort
+                # only padded the prose, which is the opposite of the
+                # "organize, don't compress" mandate in the prompt above.
+                # Re-run that sweep before raising this.
                 "effort": "low",
                 "allowed_tools": ["Read", "Grep", "Glob"],
                 "system_prompt": "You are Anderson. Organize Smith reports into structured findings. Preserve all unique signal — the calling session handles final synthesis.",
@@ -1226,7 +1237,7 @@ async def _async_main():
             parts.append(f"{n_smiths} Smiths")
             parts.append(f"{oracle.chains} Anderson{'s' if oracle.chains > 1 else ''}")
             parts.append("Caller (you)")
-            print(f"Oracle SDK v4.7.0 -- {' -> '.join(parts)}", file=sys.stderr)
+            print(f"Oracle SDK v{__version__} -- {' -> '.join(parts)}", file=sys.stderr)
             report = await oracle.run(args.question, prompts=prompts)
     except Exception as e:
         print(f"ERROR: {e}", file=sys.stderr)

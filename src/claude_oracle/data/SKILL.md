@@ -5,7 +5,7 @@ argument-hint: "[chains] [--rounds N] <research question>"
 user-invocable: true
 ---
 
-# Oracle v4.7.0 — Managed Research Rounds
+# Oracle v4.8.0 — Managed Research Rounds
 
 Use the installed `claude_oracle` package. You, the current session, are the
 orchestrator: plan the research, adapt later rounds to the findings, and write

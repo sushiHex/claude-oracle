@@ -6,6 +6,7 @@ asyncio.run (no pytest-asyncio dependency).
 """
 import asyncio
 import os
+from pathlib import Path
 
 import pytest
 
@@ -228,6 +229,30 @@ def test_extract_usage_weights_cache_tokens_against_fresh_input():
     assert s.quota_units == (expected_input + 4000 * OUTPUT_MULTIPLIER) * 1.0
     # Unweighted accounting would have charged the full 3,440 cached tokens.
     assert s.quota_units < (3 + 3040 + 400 + 4000 * OUTPUT_MULTIPLIER) * 1.0
+
+
+def test_report_footer_token_breakdown_sums_to_the_total(monkeypatch):
+    """The footer's parts must account for the total it prints. Regression:
+    total_tokens started counting cache tokens while the breakdown still showed
+    only in/out, so the numbers on screen no longer added up."""
+    import re
+
+    usage = {
+        "input_tokens": 10,
+        "output_tokens": 20,
+        "cache_read_input_tokens": 30,
+        "cache_creation_input_tokens": 40,
+    }
+    monkeypatch.setattr(sdk, "query", _fake_query([_Msg(result="finding", usage=usage)]))
+
+    prompts = [{"chain": "A", "id": 1, "dimension": "d", "prompt": "p"}]
+    report = asyncio.run(OracleSDK(chains=1).run("q", prompts=prompts))
+
+    line = next(ln for ln in report.splitlines() if ln.startswith("- Total tokens:"))
+    total, inp, out, cache_read, cache_write = (
+        int(n.replace(",", "")) for n in re.findall(r"[\d,]+", line)
+    )
+    assert inp + out + cache_read + cache_write == total
 
 
 def test_extract_usage_applies_model_weight_after_cache_weighting():
@@ -512,12 +537,12 @@ def test_scout_retry_skipped_on_systemic_failure(monkeypatch):
 # Config isolation — per-subprocess CLAUDE_CONFIG_DIR when token auth exists
 # --------------------------------------------------------------------------
 
-def _cap_query(captured):
+def _cap_query(captured, result="ok"):
     def _q(*, prompt=None, options=None, **_kw):
         captured.append(options)
 
         async def _gen():
-            yield _Msg(result="ok")
+            yield _Msg(result=result)
 
         return _gen()
 
@@ -647,6 +672,55 @@ def test_github_mcp_version_is_pinned(monkeypatch):
     mcp = sdk._github_mcp()
     pkg = [a for a in mcp["github"]["args"] if "server-github" in a][0]
     assert "@2025." in pkg  # exact-version pin, not a floating latest
+
+
+# --------------------------------------------------------------------------
+# Release hygiene
+# --------------------------------------------------------------------------
+
+def test_packaged_skill_header_matches_version():
+    """A release bumps __version__ and the packaged SKILL.md header; everything
+    else derives from the constant. The packaged copy is what external users
+    get, and it went stale at v4.3.1 and again across v4.8.0's feature PRs —
+    so the pairing is enforced here rather than remembered."""
+    skill = Path(sdk.__file__).parent / "data" / "SKILL.md"
+    header = next(
+        line for line in skill.read_text(encoding="utf-8").splitlines()
+        if line.startswith("# Oracle v")
+    )
+    assert header.startswith(f"# Oracle v{sdk.__version__} ")
+
+
+# --------------------------------------------------------------------------
+# Cost settings — benchmarked choices, not defaults left unset. Each of these
+# reaches ClaudeAgentOptions; the rationale for the value lives in sdk.py.
+# --------------------------------------------------------------------------
+
+def test_architect_plans_at_low_effort(monkeypatch):
+    captured = []
+    plan = '[{"chain": "A", "id": 1, "dimension": "d", "prompt": "p"}]'
+    monkeypatch.setattr(sdk, "query", _cap_query(captured, result=plan))
+    asyncio.run(OracleSDK(chains=1).decompose("q"))
+    assert captured[0].effort == "low"
+
+
+def test_organizer_runs_at_low_effort(monkeypatch):
+    captured = []
+    monkeypatch.setattr(sdk, "query", _cap_query(captured))
+    scouts = [ScoutResult(scout_id=1, chain="A", dimension="d", result_text="finding")]
+    asyncio.run(OracleSDK(chains=1)._run_compressor("A", scouts))
+    assert captured[0].effort == "low"
+
+
+def test_scouts_run_without_a_thinking_budget(monkeypatch):
+    captured = []
+    monkeypatch.setattr(sdk, "query", _cap_query(captured))
+    asyncio.run(OracleSDK(chains=1)._run_scout(1, "A", "d", "p"))
+    assert captured[0].thinking == {"type": "disabled"}
+    # Runaway guard only — healthy Smiths run well under this. Asserting the
+    # documented floor rather than the literal: raising it is fine, lowering
+    # it past 25 would start truncating real scouts.
+    assert captured[0].max_turns >= 25
 
 
 # --------------------------------------------------------------------------
