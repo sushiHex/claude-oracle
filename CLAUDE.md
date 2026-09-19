@@ -66,10 +66,12 @@ Failed rounds are retained as attempts and do **not** consume a round from the b
 
 ## Conventions
 - Refresh the installed skill with `python -m claude_oracle.install`; `~/.claude/skills/oracle/oracle_sdk.py` is a launcher that delegates to the installed package.
-- Version bump ALL of these together: `pyproject.toml`, `src/claude_oracle/__init__.py`,
-  the `sdk.py` docstring + banner, `data/SKILL.md` header — then copy `data/SKILL.md`
-  to `~/.claude/skills/oracle/SKILL.md` (the packaged copy is what external users get;
-  it went stale at v4.3.1 once already)
+- **A release bumps exactly two strings**: `__version__` in `src/claude_oracle/sdk.py` and the
+  `# Oracle vX.Y.Z` header in `data/SKILL.md`. Everything else derives — `pyproject.toml` reads
+  the constant through setuptools' dynamic `attr =`, `__init__.py` re-exports it, and the CLI
+  banner formats it. Then run `python -m claude_oracle.install` so the installed skill matches.
+  The packaged `SKILL.md` is what external users get: it went stale at v4.3.1, and again across
+  the two feature PRs that became v4.8.0, which is why the other strings were collapsed away.
 
 ## Gotchas (project-specific)
 - HTTP MCP transport broken in SDK v0.1.48 — stdio only
@@ -92,5 +94,6 @@ Failed rounds are retained as attempts and do **not** consume a round from the b
 - `origin` must point to `https://github.com/sushiHex/claude-oracle.git`. Confirm the repository and base branch before opening or merging a PR.
 - Use `sushiHex/claude-oracle-private` only to preserve private reports, research, and other private data. It is not a development upstream or release source.
 - **Private by policy, never published**: `research/` and Oracle report outputs. Keep these gitignored in the public checkout; preserve selected private artifacts in the private repository separately. Note `RoundSession.create()` defaults its session directory to `research/`, so live sessions are gitignored by default.
+- This extends to **benchmark figures in code comments and PR descriptions**. Publish the conclusion and a reproducible method ("sweep low/medium/high over a full-size chain, score marker recall against tokens spent"), not the private run's numbers. Keep the measurements themselves in `research/` or the private repository.
 - Preserve public Git history. Do not merge private history into the public repository or replace public `main` with an orphan snapshot. When recovering misplaced work, transfer only the reviewed source/documentation files onto a branch based on public `main`.
 - `scripts/publish_mirror.sh` is retired and exits without changing Git state. Use the normal public PR workflow.

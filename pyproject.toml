@@ -4,7 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-oracle"
-version = "4.7.0"
+# Single source of truth: src/claude_oracle/sdk.py::__version__ (see [tool.setuptools.dynamic]).
+dynamic = ["version"]
 description = "Adaptive research rounds for Claude Code — Haiku scouts, Sonnet organization, caller judgment"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -28,6 +29,9 @@ test = ["pytest>=8.0"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.setuptools.dynamic]
+version = {attr = "claude_oracle.sdk.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
