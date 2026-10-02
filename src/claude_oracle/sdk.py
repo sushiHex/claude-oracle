@@ -435,6 +435,7 @@ class OracleSDK:
         show_dollars: bool = False,
         local_tools: bool = False,
         progress_callback=None,
+        evidence_sink=None,
     ):
         if chains < 1 or chains > MAX_CHAINS:
             raise ValueError(f"Chains must be 1-{MAX_CHAINS}, got {chains}")
@@ -451,6 +452,10 @@ class OracleSDK:
         self.metrics = OracleMetrics()
         self.planned_prompts: list[dict] = []
         self.progress_callback = progress_callback
+        # Receives each scout attempt as it finishes and the final effective set,
+        # before organization starts (see rounds.ScoutEvidenceWriter).
+        self.evidence_sink = evidence_sink
+        self._replayed = False  # set by reorganize(): scouts come from saved evidence
         self._active_scouts: dict[int, str] = {}  # scout_id -> status
         self._progress_totals = {"scouts": self.scouts_total, "organizers": self.chains}
         self._completed_organizers = 0
@@ -492,6 +497,16 @@ class OracleSDK:
             self.progress_callback(update)
         except Exception as exc:
             self.log(f"  progress update unavailable: {exc}")
+
+    def _retain(self, event: str, *args) -> None:
+        """Hand scout evidence to the sink as it lands. Best-effort like progress:
+        a failed write is reported loudly but never aborts research in flight."""
+        if self.evidence_sink is None:
+            return
+        try:
+            getattr(self.evidence_sink, event)(*args)
+        except Exception as exc:
+            self.status(f"  WARNING: scout evidence not retained ({event}): {exc}")
 
     def _phase(self, name: str) -> str:
         """Return 'Phase N/T -- name' with correct numbering."""
@@ -789,8 +804,13 @@ GitHub MCP tools available — prefer these over WebSearch for repo data:
                     gate_timer.cancel()
                 _open_gate()
 
-        tasks = [_scout_with_timeout(p) for p in prompts]
-        results = list(await asyncio.gather(*tasks))
+        async def _first_attempt(p: dict) -> ScoutResult:
+            result = await _scout_with_timeout(p)
+            self._retain("scout_finished", p, result, 1)
+            return result
+
+        self.metrics.phase_usage["scout"] = _unknown_usage()  # replaced once scouting returns
+        results = list(await asyncio.gather(*(_first_attempt(p) for p in prompts)))
 
         # Retry pass: relaunch failed/timed-out Smiths ONCE, serially. The
         # launch storm is over by now, so retries start against a quiet
@@ -826,9 +846,12 @@ GitHub MCP tools available — prefer these over WebSearch for repo data:
                     )
                 if not retry.error:
                     self.status(f"  Smith #{p['id']} ({p['dimension']}) RECOVERED on retry")
+                self._retain("scout_finished", p, retry, 2)
                 results[i] = retry
         elif failed_idx:
             self.status(f"  Retry pass SKIPPED: {len(failed_idx)}/{len(results)} Smiths failed (systemic)")
+        # The effective set is final here, before any organizer starts.
+        self._retain("scouting_finished", prompts, results)
 
         # Aggregate usage
         phase_usage = UsageStats()
@@ -1003,6 +1026,10 @@ Organize, don't compress — the calling session will do the editorial judgment.
             tasks.append(_compress_with_timeout(chain, scouts, delay=delay))
             dispatched += 1
 
+        if tasks:
+            # Spend is in flight: if this phase is interrupted before the aggregate
+            # below replaces it, its usage must read as unknown, never as zero.
+            self.metrics.phase_usage["compress"] = _unknown_usage()
         live_results = list(await asyncio.gather(*tasks)) if tasks else []
         results = sorted(live_results + skipped, key=lambda r: r.chain)
 
@@ -1035,6 +1062,7 @@ Organize, don't compress — the calling session will do the editorial judgment.
         self.metrics = OracleMetrics(start_time=time.time())
         self.planned_prompts = []
         self._completed_organizers = 0
+        self._replayed = False
 
         if prompts:
             # Normalize (idempotent) and validate library-supplied prompts, so the
@@ -1049,6 +1077,7 @@ Organize, don't compress — the calling session will do the editorial judgment.
             prompts = await self.decompose(question)
 
         self.planned_prompts = prompts
+        self._retain("plan_ready", prompts)  # durable before any scout is dispatched
         self._progress_totals = {
             "scouts": len(prompts),
             "organizers": len({p["chain"] for p in prompts}),
@@ -1064,49 +1093,74 @@ Organize, don't compress — the calling session will do the editorial judgment.
             report = "ERROR: All Smiths failed or timed out. No data to synthesize."
         else:
             # Phase 3: Compress (one per chain, parallel, isolated)
-            compressor_results = await self.compress(scout_results)
+            report = self._render_report(await self.compress(scout_results))
+        return report + self._metrics_footer()
 
-            if not compressor_results:
-                report = "ERROR: No compressor results"
-            elif self.chains == 1:
-                r = compressor_results[0]
-                if not r.error:
-                    report = r.summary or "ERROR: Anderson returned an empty synthesis."
-                elif r.fallback_scouts:
-                    report = (
-                        f"## Anderson FAILED ({r.error}) — RAW SMITH FALLBACK\n\n"
-                        f"_Anderson synthesis failed. The raw Smith outputs are preserved below verbatim — "
-                        f"re-dispatch Anderson on these without re-running the Smiths._\n\n"
-                        f"{self._raw_smith_fallback(r.fallback_scouts)}"
-                    )
-                else:
-                    report = f"ERROR: {r.error}"
+    async def reorganize(self, scout_results: list[ScoutResult]) -> str:
+        """Organizer-only replay over saved scout results: no Architect, no scouts.
+
+        Chain isolation is compress()'s own grouping, so a replay cannot mix
+        chains. Usage covers the organizers only; the original scouting was
+        accounted for (or lost) with its own attempt.
+        """
+        self.metrics = OracleMetrics(start_time=time.time())
+        self._completed_organizers = 0
+        self._replayed = True
+        self._has_architect = False
+        self.scouts_total = len(scout_results)
+        self.chains = len({r.chain for r in scout_results})
+        if not 1 <= self.chains <= MAX_CHAINS:
+            raise ValueError(f"Saved evidence spans {self.chains} chains; must be 1-{MAX_CHAINS}")
+        self._progress_totals = {"scouts": self.scouts_total, "organizers": self.chains}
+        self.metrics.scout_count = len(scout_results)
+        self.metrics.scout_errors = sum(1 for r in scout_results if r.error)
+        try:
+            report = self._render_report(await self.compress(scout_results))
+        finally:
+            self._cleanup_isolation()
+        return report + self._metrics_footer()
+
+    def _render_report(self, compressor_results: list[CompressorResult]) -> str:
+        """Render organizer output, falling back to raw Smith text per failed chain."""
+        if not compressor_results:
+            return "ERROR: No compressor results"
+        if self.chains == 1:
+            r = compressor_results[0]
+            if not r.error:
+                return r.summary or "ERROR: Anderson returned an empty synthesis."
+            if r.fallback_scouts:
+                return (
+                    f"## Anderson FAILED ({r.error}) — RAW SMITH FALLBACK\n\n"
+                    f"_Anderson synthesis failed. The raw Smith outputs are preserved below verbatim — "
+                    f"re-dispatch Anderson on these without re-running the Smiths._\n\n"
+                    f"{self._raw_smith_fallback(r.fallback_scouts)}"
+                )
+            return f"ERROR: {r.error}"
+        # Multi-chain: return all Anderson reports directly to the calling session.
+        chain_reports = []
+        for r in compressor_results:
+            if not r.error:
+                chain_reports.append(f"{'=' * 60}\n## Chain {r.chain} — Anderson Report\n{'=' * 60}\n\n{r.summary}")
+            elif r.fallback_scouts:
+                # Anderson failed but the scouts succeeded — emit raw outputs so
+                # recovery is "redo Anderson on these N Smiths", not "redo all N."
+                chain_reports.append(
+                    f"{'=' * 60}\n## Chain {r.chain} — ANDERSON FAILED ({r.error}) — RAW SMITH FALLBACK\n{'=' * 60}\n\n"
+                    f"_Anderson synthesis failed for this chain. The {len(r.fallback_scouts)} raw Smith outputs "
+                    f"are preserved below verbatim — caller can re-dispatch Anderson on these without re-running the Smiths._\n\n"
+                    f"{self._raw_smith_fallback(r.fallback_scouts)}"
+                )
             else:
-                # Multi-chain: return all Anderson reports directly to the calling session.
-                chain_reports = []
-                for r in compressor_results:
-                    if not r.error:
-                        chain_reports.append(f"{'=' * 60}\n## Chain {r.chain} — Anderson Report\n{'=' * 60}\n\n{r.summary}")
-                    elif r.fallback_scouts:
-                        # Anderson failed but the scouts succeeded — emit raw outputs so
-                        # recovery is "redo Anderson on these N Smiths", not "redo all N."
-                        chain_reports.append(
-                            f"{'=' * 60}\n## Chain {r.chain} — ANDERSON FAILED ({r.error}) — RAW SMITH FALLBACK\n{'=' * 60}\n\n"
-                            f"_Anderson synthesis failed for this chain. The {len(r.fallback_scouts)} raw Smith outputs "
-                            f"are preserved below verbatim — caller can re-dispatch Anderson on these without re-running the Smiths._\n\n"
-                            f"{self._raw_smith_fallback(r.fallback_scouts)}"
-                        )
-                    else:
-                        chain_reports.append(f"## Chain {r.chain} — ERROR: {r.error}")
-                report = "\n\n".join(chain_reports)
+                chain_reports.append(f"## Chain {r.chain} — ERROR: {r.error}")
+        return "\n\n".join(chain_reports)
 
-        # Append metrics footer
+    def _metrics_footer(self) -> str:
         m = self.metrics
         total = m.total_usage
         parts = []
         if self._has_architect:
             parts.append("Architect")
-        parts.append(f"{self.scouts_total} Smiths")
+        parts.append(f"{self.scouts_total} Smiths" + (" (saved evidence, not re-run)" if self._replayed else ""))
         parts.append(f"{self.chains} Anderson{'s' if self.chains > 1 else ''}")
         parts.append("Caller (you)")
         arch = " -> ".join(parts)
@@ -1129,7 +1183,7 @@ Organize, don't compress — the calling session will do the editorial judgment.
 - Phase timing: {' | '.join(f'{k}: {v:.0f}s' for k, v in m.phase_times.items())}
 - Phase costs: {phase_costs}
 """
-        return report + footer
+        return footer
 
 
 def main_sync():
@@ -1157,6 +1211,10 @@ async def _async_main():
     session_options.add_argument("--session-status", metavar="SESSION",
         help="Print lifecycle, outcome, live phase/progress, checkpoint, and usage as JSON "
              "without running models or reading stdin")
+    session_options.add_argument("--recover", metavar="SESSION",
+        help="Re-run only the organizers over the latest attempt's saved scout evidence "
+             "and print a separate recovery report (no Architect, no scouts, no round "
+             "consumed; does not read stdin)")
     parser.add_argument("--verbose", "-v", action="store_true", help="Show tool activity per scout")
     parser.add_argument("--local", action="store_true",
         help="Grant scouts local file tools (Read/Grep/Glob) for questions about "
@@ -1168,7 +1226,7 @@ async def _async_main():
 
     if args.rounds is not None and args.rounds < 1:
         parser.error("--rounds must be a positive integer")
-    if (args.resume or args.session_status) and (
+    if (args.resume or args.session_status or args.recover) and (
         args.question or args.rounds is not None
         or args.chains is not None or args.local or args.usd
     ):
@@ -1186,6 +1244,15 @@ async def _async_main():
         except (OSError, ValueError) as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             sys.exit(1)
+        return
+    if args.recover:
+        try:
+            session = RoundSession.open(args.recover)
+            report = await session.recover_organizers(verbose=args.verbose)
+        except Exception as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            sys.exit(1)
+        print(report)
         return
 
     prompts = None

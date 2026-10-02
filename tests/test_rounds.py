@@ -289,8 +289,9 @@ def test_failed_round_preserves_observed_progress(monkeypatch):
     with pytest.raises(RuntimeError, match="transport disconnected"):
         asyncio.run(session.run_round(plan()))
     progress = session.status()["progress"]
+    # "retained" is 0: this fake run returned no scout evidence, so nothing survived to disk.
     assert progress == {
-        "scouts": {"completed": 3, "total": 10},
+        "scouts": {"completed": 3, "total": 10, "retained": 0},
         "organizers": {"completed": 1, "total": 1},
     }
 

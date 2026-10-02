@@ -67,6 +67,7 @@ The `claude-oracle` console command is equivalent. Without supplied prompts, a S
 | `--session-dir PATH` | Create a session at a new directory, including for a single round. Multiple rounds otherwise use `research/oracle-<unique-id>`. |
 | `--resume PATH` | Run the next round with a fresh JSON prompt array on stdin, using saved session settings. |
 | `--session-status PATH` | Print the session's lifecycle, research outcome, live phase and progress, checkpoint, artifact paths, and usage as JSON. Never runs models or reads stdin. |
+| `--recover PATH` | Re-run only the organizers over the latest attempt's saved scout evidence and write a separate recovery report. Launches no scouts or Architect and consumes no round. |
 | `--verbose`, `-v` | Add per-scout tool activity to the progress log. |
 | `--report`, `-r` | Also save `oracle-report-YYYYMMDD-HHMMSS.md` in the current directory. |
 | `--local` | Grant scouts local `Read`, `Grep`, and `Glob` tools for repository research. |

@@ -56,7 +56,12 @@ research/oracle-<id>/
   .round.lock     — non-blocking OS lock: one round writer per session
   .session.lock   — blocking OS lock: serializes session.json read-modify-writes
   rounds/round-NNN-attempt-NNN/{prompts.json, report.md, metrics.json}
+    scouts/scout-<id>-attempt-<k>.json   — one record per scout attempt, written as it finishes
+    scouts/manifest.json                 — effective record per scout; absent = incomplete set
+    recovery-NNN/{report.md, metrics.json} — organizer-only replay (recover_organizers / --recover)
 ```
+
+**Scout evidence is persisted at the scout→organize seam.** `OracleSDK(evidence_sink=...)` receives `scout_finished` for every attempt (retry = attempt 2) and `scouting_finished` once the effective set is final, all before `compress()` starts; `rounds.ScoutEvidenceWriter` writes them atomically. Sink failures are logged, never raised — evidence is best-effort like progress, and must not abort research in flight. `recover_organizers()` rebuilds `ScoutResult`s from disk (`load_scout_evidence`) and calls `OracleSDK.reorganize()`, which runs `compress()` only: no Architect, no scouts, and chain isolation comes from `compress()`'s own grouping. It takes `.round.lock`, never touches `canonical.md` or `completed_rounds`, and records organizer-only usage under `recoveries`.
 
 Failed rounds are retained as attempts and do **not** consume a round from the budget; resuming retries the same round number in a new attempt directory. `.round.lock` deliberately does not cover `canonical.md`, because the caller is expected to revise it while the next round runs.
 

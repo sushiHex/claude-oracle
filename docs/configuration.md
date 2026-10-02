@@ -75,7 +75,7 @@ Each new round session includes a `.gitignore` that excludes its contents, inclu
 | Report contains errors or raw scout output | Follow [failure handling](agent-usage.md#handle-results-and-failures); a successful process exit can still contain incomplete research. |
 | `--rounds 3` returns after one round | Expected: the current agent plans the next round and uses `--resume`. The `/oracle` skill manages this loop. See [managed rounds](agent-usage.md#managed-rounds). |
 | Session already has a round running | Keep observing that process and update the canonical report. Do not launch a duplicate; the OS releases the lock when the process exits. |
-| A crashed session still says `running` | Confirm its process exited, then resume with a fresh plan. The old attempt is retained as interrupted. |
+| A crashed session still says `running` | Confirm its process exited. If `progress.scouts.retained` is above zero, run `--recover` to organize the saved scout findings without re-running scouts; otherwise resume with a fresh plan. The old attempt is retained as interrupted. Leftover `.round.lock`/`.session.lock` files are expected and do not block either path. |
 | Session directory already exists | Choose a new directory for new research; use `--resume` to continue existing research. |
 
 Use `--verbose` to capture tool activity alongside progress. When opening an issue, include the package version, OS, Python version, command shape, and sanitized diagnostics. Remove prompts, findings, paths, and credentials you do not intend to share.
