@@ -124,8 +124,11 @@ work succeeds, `partial` when a usable report includes failed or skipped work, a
 `failed` when the round cannot return research. Status also exposes `current_phase`,
 `progress`, `active_attempt`, `last_updated_at`, and `next_action`. Progress is
 updated as scouts and organizers finish, so `--session-status` can be polled
-while a round is running. These fields are runtime evidence, not a judgment
-about prose quality.
+while a round is running. `progress.scouts.completed` counts scouts that **ran**;
+`progress.scouts.retained` counts successful findings **saved on disk**, which is
+what survives if the process dies. Sessions written by versions before `retained`
+existed omit it. These fields are runtime evidence, not a judgment about prose
+quality.
 
 The caller records editorial progress explicitly after revising the canonical
 report: `session.checkpoint(revision="git-or-content-revision", through_round=1)`.
@@ -156,13 +159,38 @@ research/queues-run1/
   rounds/
     round-001-attempt-001/
       prompts.json                     # effective scout plan
+      scouts/
+        scout-001-attempt-1.json       # one record per scout attempt, saved as it finishes
+        scout-003-attempt-2.json       # attempt 2 is the retry pass
+        manifest.json                  # written when scouting finishes; absent = incomplete set
       report.md                        # returned research, including errors
       metrics.json                     # per-round usage, timing, error counts
+      recovery-001/                    # only after organizer-only recovery
+        report.md
+        metrics.json
     round-002-attempt-001/
       ...
 ```
 
-Read attempt paths from `session.json`. A supplied plan is saved before research starts; an Architect-generated plan is saved when the call returns or raises after planning. An abrupt process termination can prevent that generated plan from being saved.
+Read attempt paths from `session.json`. A supplied plan is saved before research starts, and an Architect-generated plan is saved as soon as planning finishes, before any scout is dispatched.
+
+#### Scout evidence
+
+Each scout attempt is written atomically to `scouts/` the moment it finishes, before any organizer starts, so a kill during organization no longer discards successful scouting. A record (`schema: claude-oracle/scout-evidence`, `schema_version: 1`) holds `scout_id`, `chain`, `dimension`, the effective `prompt`, `scout_attempt`, `status` (`succeeded`/`failed`), the verbatim `result_text`, `error`, `duration_ms`, `recorded_at`, and `usage` in the same shape as `reported_usage` (unavailable fields are null, never zero). A failed first attempt and its retry are separate records. `manifest.json` lists the planned scouts and the **effective** record per scout — the one the organizer received. If `manifest.json` is missing, scouting stopped early and the set is incomplete; if it says `complete: false`, some scouts have no saved record. An effective result that could not be written appears as `"record": null` rather than falling back to an earlier attempt.
+
+Evidence is saved for round sessions only; a one-shot run without a session directory keeps its results in memory as before. Saved findings are web research output: treat them like `report.md`, as private local data.
+
+#### Organizer-only recovery
+
+When scouting succeeded but organization did not — a timeout, an organizer error, or a killed process — replay the organizers over the saved evidence instead of re-running the round:
+
+```sh
+python -m claude_oracle --recover research/queues-run1
+```
+
+From Python: `await RoundSession.open(path).recover_organizers()`, or pass `attempt="rounds/round-001-attempt-001"` to choose an attempt other than the latest one with evidence.
+
+Recovery launches **no Architect and no scouts**. It runs one organizer per chain, each seeing only its own chain's saved findings, with the usual organizer timeout. The report is printed and written to a new `recovery-NNN/` directory in that attempt; `canonical.md`, earlier reports, and scout records are never modified. Recovery does **not** change the round budget or `completed_rounds`: read the recovered report, then continue with a fresh plan as usual. Each recovery is recorded under `recoveries` in `session.json` with its own organizer-only `usage`, which is added to `reported_usage` once; the replayed scouts are not counted again. An incomplete evidence set is labeled at the top of the recovered report, and each missing scout reaches its organizer as an explicit error. While recovery runs, status shows `current_phase: "recovery"` with `active_attempt` pointing at the `recovery-NNN/` directory; afterwards the phase returns to its previous value. If recovery fails, its entry is marked `failed` and any organizer spend that was not observed makes `reported_usage` unavailable rather than undercounted. Recovery takes the round lock, so it refuses to run while a round is running; if persisted status still says `running` but the lock is free, recovery marks that attempt (or an earlier recovery) `interrupted`.
 
 | Status | Meaning and next action |
 | --- | --- |
@@ -171,7 +199,7 @@ Read attempt paths from `session.json`. A supplied plan is saved before research
 | `failed` | An exception or cancellation stopped the attempt; diagnose and resume with a new plan. |
 | `rounds_complete` | All requested research calls returned; finish the canonical report. |
 
-An OS lock prevents simultaneous rounds in one session and releases on process exit. After a crash, persisted status may still say `running`; once the old process has exited, resume marks that attempt `interrupted` and retries the same round in a new directory. Failed and interrupted attempts remain on disk and do not consume the round budget. A returned report with model errors **does** count as a round: inspect metrics and diagnose systemic failures before spending further rounds.
+An OS lock prevents simultaneous rounds in one session and releases on process exit. The one-byte `.round.lock` and `.session.lock` files remain after a crash by design; the lock is held by the process, not by the file, so leftover files never block resume or recovery. On Windows the OS releases a killed process's locks asynchronously, so a resume or recovery started immediately after a crash can briefly report that a round is running; retry after a few seconds. After a crash, persisted status may still say `running`; once the old process has exited, resume marks that attempt `interrupted` and retries the same round in a new directory. A crashed attempt never recorded its usage, so marking it interrupted also makes the session's `reported_usage` unavailable: the true total is unknown, and reporting the earlier figure would silently omit that attempt's spend. Failed and interrupted attempts remain on disk and do not consume the round budget. A returned report with model errors **does** count as a round: inspect metrics and diagnose systemic failures before spending further rounds.
 
 ### Python sessions
 
@@ -206,8 +234,9 @@ Organizers are prompted to return findings by theme, corrections, disputes, and 
 | Invalid input or an uncaught run error | Diagnostic on stderr; nonzero exit | Correct input or environment before retrying. |
 | Some scouts fail | One serial retry each, normally only when no more than half failed | Inspect reported errors and coverage. |
 | All scouts in a chain fail | That organizer is skipped | Treat the chain as missing evidence. |
-| Organizer timeout or exception escaping the organizer | Raw scout fallback can appear in the report | Reuse preserved findings for synthesis instead of repeating all research. |
-| Error caught inside the organizer's query handler | Error returned; raw fallback is not attached on this path | Do not assume all scout results were retained. |
+| Organizer timeout or exception escaping the organizer | Raw scout fallback can appear in the report | Reuse preserved findings for synthesis, or run `--recover` to organize them again. |
+| Error caught inside the organizer's query handler | Error returned; raw fallback is not attached on this path | In a round session the scout evidence is still on disk: run `--recover`. |
+| Process killed or cancelled after scouting | Completed scouts are saved in `scouts/`; the attempt is `failed` or still `running` | Check `progress.scouts.retained`, then run `--recover` instead of repeating the round. |
 
 **Exit code zero does not guarantee complete findings.** All-scout failure and some organizer failures are returned as report text. Inspect `ERROR`, `FAILED`, and `RAW SMITH FALLBACK` sections together with the execution metrics. For the Python API, inspect error counts as well as the returned text; generated report content is not a stable machine-readable status schema.
 

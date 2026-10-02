@@ -150,6 +150,19 @@ An ordinary returned report can still contain failed model work: inspect the
 metrics and stop to diagnose systemic failures instead of blindly spending the
 remaining rounds.
 
+Scout findings are saved to the attempt's `scouts/` directory as each scout
+finishes. If a round dies or its organizers fail after scouting (status shows
+`progress.scouts.retained` above zero), do not re-run the round. Recover the
+organization from the saved findings instead:
+
+```sh
+python -m claude_oracle --recover research/oracle-topic-run1
+```
+
+Recovery launches no scouts and no Architect, keeps each chain isolated, writes
+a new `recovery-NNN/report.md` in that attempt, and leaves the round budget
+unchanged. Read it like a round report, then continue with a fresh plan.
+
 ## Finish
 
 When session status is `rounds_complete`, perform the final substantive revision

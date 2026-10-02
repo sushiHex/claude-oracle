@@ -36,4 +36,4 @@ Use concise, action-oriented commit subjects; prefixes such as `docs:`, `CI:`, o
 
 ## Security & Configuration
 
-Keep local scout tools opt-in via `--local`, preserve per-chain isolation and untruncated scout output, and retain the pinned GitHub MCP version. Never commit tokens or copy refresh credentials. Keep `research/` private and excluded from public commits.
+Keep local scout tools opt-in via `--local`, preserve per-chain isolation and untruncated scout output, and retain the pinned GitHub MCP version. Never commit tokens or copy refresh credentials. Keep `research/` private and excluded from public commits; this includes the raw scout evidence round sessions save under each attempt's `scouts/` directory. Organizer-only recovery (`--recover`, `RoundSession.recover_organizers`) must never launch scouts or the Architect, mix chains, rewrite `canonical.md`, or change the round budget.

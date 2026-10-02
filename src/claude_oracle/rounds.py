@@ -6,11 +6,18 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import re
 import tempfile
 
 
 DEFAULT_ROUNDS = 1
 SCHEMA_VERSION = 2
+
+EVIDENCE_DIR = "scouts"
+EVIDENCE_SCHEMA = "claude-oracle/scout-evidence"
+EVIDENCE_SCHEMA_VERSION = 1
+_RECORD_NAME = re.compile(r"scout-(\d+)-attempt-(\d+)\.json")
+_ATTEMPT_NAME = re.compile(r"round-(\d{3})-attempt-\d{3}")
 
 _OUTCOMES = {"complete", "partial", "failed", "unknown"}
 _USAGE_FIELDS = (
@@ -37,6 +44,7 @@ def _status_defaults(state: dict) -> dict:
     state.setdefault("next_action", "Run the first research round")
     state.setdefault("checkpoint", {"path": "canonical.md", "revision": None, "through_round": 0})
     state.setdefault("artifact_paths", [])
+    state.setdefault("recoveries", [])
     usage = state.setdefault("reported_usage", _empty_reported_usage())
     if not isinstance(usage, dict):
         usage = _empty_reported_usage()
@@ -122,7 +130,10 @@ def _session_lock(path: Path):
     with _file_lock(
         path,
         blocking=False,
-        error_message="This session already has a round running",
+        # Windows releases a killed process's locks asynchronously, so a resume or
+        # recovery launched right after a crash can briefly see the old owner.
+        error_message=("This session already has a round running "
+                       "(if its process just exited, retry in a few seconds)"),
     ):
         yield
 
@@ -132,6 +143,147 @@ def _state_lock(path: Path):
     """Serialize read-modify-write updates to session.json."""
     with _file_lock(path, blocking=True):
         yield
+
+
+def _usage_record(usage) -> dict:
+    if not getattr(usage, "usage_observed", False) or not getattr(usage, "usage_available", False):
+        return _empty_reported_usage()
+    return {**{key: getattr(usage, key, None) for key in _USAGE_FIELDS}, "available": True}
+
+
+class ScoutEvidenceWriter:
+    """OracleSDK evidence sink: persist every scout attempt the moment it finishes.
+
+    Layout inside an attempt directory:
+      scouts/scout-<id>-attempt-<k>.json   one record per attempt (k=2 is the retry)
+      scouts/manifest.json                 written once scouting finishes; names the
+                                           effective record per scout. No manifest
+                                           means the set is incomplete.
+    """
+
+    def __init__(self, folder: Path, on_retained=None):
+        self.folder = folder
+        self.on_retained = on_retained
+        self.effective: dict[int, dict] = {}
+
+    @property
+    def retained(self) -> int:
+        """Scouts whose effective result is a successful finding saved on disk."""
+        return sum(1 for entry in self.effective.values()
+                   if entry["status"] == "succeeded" and entry["record"] is not None)
+
+    def plan_ready(self, prompts: list[dict]) -> None:
+        """Save the effective plan before dispatch, so a hard kill during an
+        Architect-planned round still identifies every scout (and chain) planned."""
+        _write_json(self.folder.parent / "prompts.json", prompts)
+
+    def scout_finished(self, prompt: dict, result, scout_attempt: int) -> None:
+        scout_id = prompt["id"]
+        name = f"scout-{scout_id:03d}-attempt-{scout_attempt}.json"
+        status = "failed" if result.error else "succeeded"
+        # The organizer receives this attempt whether or not it can be saved; an
+        # unsaved effective result must never fall back to an earlier record.
+        self.effective[scout_id] = {"record": None, "status": status}
+        self._write_record(self.folder / name, {
+            "schema": EVIDENCE_SCHEMA,
+            "schema_version": EVIDENCE_SCHEMA_VERSION,
+            "scout_id": scout_id,
+            "chain": prompt["chain"],
+            "dimension": prompt.get("dimension", ""),
+            "prompt": prompt["prompt"],
+            "scout_attempt": scout_attempt,
+            "status": status,
+            "result_text": result.result_text or "",
+            "error": result.error,
+            "duration_ms": result.duration_ms,
+            "recorded_at": _now(),
+            "usage": _usage_record(result.usage),
+        })
+        self.effective[scout_id]["record"] = name
+        if self.on_retained is not None:
+            self.on_retained(self.retained)
+
+    def scouting_finished(self, prompts: list[dict], results) -> None:
+        planned = [p["id"] for p in prompts]
+        _write_json(self.folder / "manifest.json", {
+            "schema": EVIDENCE_SCHEMA,
+            "schema_version": EVIDENCE_SCHEMA_VERSION,
+            "complete": all(self.effective.get(scout_id, {}).get("record") for scout_id in planned),
+            "planned_scouts": planned,
+            "effective": {str(k): v for k, v in sorted(self.effective.items())},
+            "recorded_at": _now(),
+        })
+
+    def _write_record(self, path: Path, record: dict) -> None:
+        self.folder.mkdir(exist_ok=True)
+        _write_json(path, record)
+
+
+def load_scout_evidence(attempt: Path):
+    """Rebuild the organizer input for one attempt from its saved evidence.
+
+    Returns (scout_results, complete, missing_ids, plan_known). Without a manifest
+    the latest saved attempt per scout is used and the set is incomplete. Planned
+    scouts with no usable record become explicit errors, so the organizer reports
+    the gap instead of silently narrowing coverage.
+    """
+    from .sdk import ScoutResult, UsageStats
+
+    def read(path: Path):
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+
+    evidence = attempt / EVIDENCE_DIR
+    prompts = read(attempt / "prompts.json")
+    plan_known = isinstance(prompts, list)
+    planned = {p["id"]: p for p in prompts or [] if isinstance(p, dict) and "id" in p}
+    manifest = read(evidence / "manifest.json")
+    if not (isinstance(manifest, dict) and isinstance(manifest.get("effective"), dict)):
+        manifest = None  # unreadable manifest: fall back to scanning, and the set is incomplete
+    # Why a planned scout has no usable record; each becomes an explicit organizer error.
+    gaps: dict[int, str] = {}
+    if manifest is not None:
+        chosen = {int(k): v["record"] for k, v in manifest["effective"].items() if v.get("record")}
+        gaps.update({int(k): "Evidence not saved (the effective result could not be written)"
+                     for k, v in manifest["effective"].items() if not v.get("record")})
+    else:
+        latest: dict[int, tuple[int, str]] = {}
+        for path in evidence.glob("scout-*-attempt-*.json"):
+            match = _RECORD_NAME.fullmatch(path.name)
+            if match:
+                scout_id, scout_attempt = int(match[1]), int(match[2])
+                if scout_attempt > latest.get(scout_id, (0, ""))[0]:
+                    latest[scout_id] = (scout_attempt, path.name)
+        chosen = {scout_id: name for scout_id, (_, name) in latest.items()}
+
+    results = []
+    for scout_id, name in chosen.items():
+        record = read(evidence / name)
+        try:
+            if record.get("schema") != EVIDENCE_SCHEMA or record.get("schema_version") != EVIDENCE_SCHEMA_VERSION:
+                raise ValueError("unsupported format")
+            results.append(ScoutResult(
+                scout_id=record["scout_id"], chain=record["chain"], dimension=record["dimension"],
+                result_text=record["result_text"], error=record["error"],
+                duration_ms=record["duration_ms"], usage=UsageStats(),
+            ))
+        except (AttributeError, KeyError, TypeError, ValueError):
+            gaps[scout_id] = f"Evidence unreadable ({name}); the other saved findings are unaffected"
+    loaded = {r.scout_id for r in results}
+    missing = sorted((set(planned) | set(gaps)) - loaded)
+    for scout_id in missing:
+        prompt = planned.get(scout_id)
+        if prompt is None:
+            continue  # no plan to say which chain it belonged to; still listed as missing
+        results.append(ScoutResult(
+            scout_id=scout_id, chain=prompt["chain"], dimension=prompt.get("dimension", ""),
+            result_text="", usage=UsageStats(),
+            error=gaps.get(scout_id, "Evidence not retained (scouting stopped before this scout finished)"),
+        ))
+    complete = bool(manifest and manifest.get("complete")) and plan_known and not missing
+    return sorted(results, key=lambda r: (r.chain, r.scout_id)), complete, missing, plan_known
 
 
 class RoundSession:
@@ -242,6 +394,7 @@ class RoundSession:
             or not isinstance(state["checkpoint"].get("through_round"), int)
             or not 0 <= state["checkpoint"]["through_round"] <= completed
             or not isinstance(state.get("artifact_paths"), list)
+            or not isinstance(state.get("recoveries"), list)
             or not isinstance(state.get("reported_usage"), dict)
         ):
             raise ValueError("Invalid Oracle round session state")
@@ -256,7 +409,8 @@ class RoundSession:
             _write_json(self.path / "session.json", state)
 
     @staticmethod
-    def _artifact_paths(base: Path, existing: list, current: Path) -> list[str]:
+    def _artifact_paths(base: Path, existing: list, current: Path,
+                        names: tuple = ("prompts.json", "report.md", "metrics.json")) -> list[str]:
         """Keep session artifacts relative and retain previous rounds."""
         paths: list[str] = []
         for raw in existing:
@@ -271,20 +425,13 @@ class RoundSession:
             normalized = path.as_posix()
             if normalized not in paths:
                 paths.append(normalized)
-        for name in ("prompts.json", "report.md", "metrics.json"):
+        for name in names:
             path = (current / name).relative_to(base).as_posix()
             if path not in paths:
                 paths.append(path)
         return paths
 
-    @staticmethod
-    def _usage_snapshot(usage) -> dict:
-        if not getattr(usage, "usage_observed", False) or not getattr(usage, "usage_available", False):
-            return _empty_reported_usage()
-        return {
-            **{key: getattr(usage, key, None) for key in _USAGE_FIELDS},
-            "available": True,
-        }
+    _usage_snapshot = staticmethod(_usage_record)
 
     @staticmethod
     def _record_usage(state: dict, usage, had_prior_attempts: bool) -> dict:
@@ -303,6 +450,29 @@ class RoundSession:
             reported[key] += snapshot[key]
         reported["available"] = True
         return reported
+
+    @staticmethod
+    def _interrupt_stale(state: dict) -> bool:
+        """Mark work that lost its process as interrupted; True if a research
+        attempt died. Only call while holding .round.lock: holding it proves no
+        live process owns anything still marked 'running'.
+
+        Dead work recorded no usage, so a session total that omits it would be a
+        silent undercount: make it unknown. A dead recovery is not a failed round:
+        it restores the lifecycle phase it displaced instead of failing the session.
+        """
+        def interrupt(entries: list) -> list:
+            dead = [entry for entry in entries if entry["status"] == "running"]
+            for entry in dead:
+                entry.update(status="interrupted", finished_at=_now())
+                if "usage" not in entry:
+                    state["reported_usage"] = _empty_reported_usage()
+            return dead
+
+        for recovery in interrupt(state["recoveries"]):
+            if state["active_attempt"] == recovery["directory"]:
+                state.update(current_phase=recovery.get("previous_phase", "idle"), active_attempt=None)
+        return bool(interrupt(state["attempts"]))
 
     @staticmethod
     def _research_outcome(metrics) -> str:
@@ -356,9 +526,7 @@ class RoundSession:
                     raise ValueError("Scout IDs must be positive integers")
                 if len(set(ids)) != len(ids):
                     raise ValueError("Scout IDs must be unique within a round")
-            for previous in state["attempts"]:
-                if previous["status"] == "running":
-                    previous.update(status="interrupted", finished_at=_now())
+            self._interrupt_stale(state)
             attempt_number = 1
             while True:
                 relative = Path("rounds") / f"round-{number:03d}-attempt-{attempt_number:03d}"
@@ -382,13 +550,23 @@ class RoundSession:
             state["research_outcome"] = "unknown"
             state["current_phase"] = "research"
             state["active_attempt"] = relative.as_posix()
-            state["progress"] = {"scouts": {"completed": 0, "total": len(prompts or [])}, "organizers": {"completed": 0, "total": len({p["chain"] for p in prompts or []})}}
+            state["progress"] = {"scouts": {"completed": 0, "total": len(prompts or []), "retained": 0}, "organizers": {"completed": 0, "total": len({p["chain"] for p in prompts or []})}}
             state["last_updated_at"] = _now()
             state["next_action"] = "Wait for research results"
+
+            # "completed" counts scouts that ran; "retained" counts findings saved
+            # on disk, which is what survives if this process dies mid-round.
+            def on_retained(count: int) -> None:
+                state["progress"]["scouts"]["retained"] = count
+                state["last_updated_at"] = _now()
+                self._persist_state(state)
+
+            evidence = ScoutEvidenceWriter(folder / EVIDENCE_DIR, on_retained=on_retained)
 
             def on_progress(update: dict) -> None:
                 state["current_phase"] = update["phase"]
                 state["progress"] = update["progress"]
+                state["progress"]["scouts"]["retained"] = evidence.retained
                 state["last_updated_at"] = _now()
                 self._persist_state(state)
 
@@ -396,7 +574,7 @@ class RoundSession:
             oracle = OracleSDK(
                 chains=state["chains"], verbose=verbose,
                 local_tools=state["local_tools"], show_dollars=state["show_dollars"],
-                progress_callback=on_progress,
+                progress_callback=on_progress, evidence_sink=evidence,
             )
             oracle.status(f"Round {number}/{state['rounds']} | session: {self.path}")
             oracle.status(f"Canonical report: {self.path / 'canonical.md'} (maintained by caller)")
@@ -416,13 +594,16 @@ class RoundSession:
                 state["research_outcome"] = self._research_outcome(oracle.metrics)
                 state["current_phase"] = "complete"
                 state["active_attempt"] = None
-                state["progress"] = {"scouts": {"completed": oracle.metrics.scout_count, "total": oracle.scouts_total}, "organizers": {"completed": oracle.metrics.compressor_count, "total": oracle.metrics.chain_count}}
+                state["progress"] = {"scouts": {"completed": oracle.metrics.scout_count, "total": oracle.scouts_total, "retained": evidence.retained}, "organizers": {"completed": oracle.metrics.compressor_count, "total": oracle.metrics.chain_count}}
                 state["reported_usage"] = self._record_usage(
                     state, oracle.metrics.total_usage, had_prior_attempts
                 )
                 attempt["usage"] = self._usage_snapshot(oracle.metrics.total_usage)
+                names = ("prompts.json", "report.md", "metrics.json")
+                if (folder / EVIDENCE_DIR / "manifest.json").exists():
+                    names += (f"{EVIDENCE_DIR}/manifest.json",)
                 state["artifact_paths"] = self._artifact_paths(
-                    self.path, state.get("artifact_paths", []), self.path / relative
+                    self.path, state.get("artifact_paths", []), self.path / relative, names
                 )
                 state["last_updated_at"] = _now()
                 state["next_action"] = "Revise canonical.md and record a checkpoint" if state["status"] == "rounds_complete" else "Prepare a fresh plan for the next round"
@@ -446,6 +627,7 @@ class RoundSession:
                     "scouts": {
                         "completed": min(oracle.metrics.scout_count, oracle.scouts_total),
                         "total": oracle.scouts_total,
+                        "retained": evidence.retained,
                     },
                     "organizers": {
                         "completed": min(oracle.metrics.compressor_count, oracle.metrics.chain_count),
@@ -453,7 +635,10 @@ class RoundSession:
                     },
                 }
                 state["last_updated_at"] = _now()
-                state["next_action"] = "Retry the failed round with a fresh plan"
+                state["next_action"] = (
+                    "Recover organizers from the retained scout evidence, or retry the round with a fresh plan"
+                    if evidence.retained else "Retry the failed round with a fresh plan"
+                )
                 # Keep the original failure if recording it also fails (e.g. disk full).
                 try:
                     if oracle.planned_prompts:
@@ -469,4 +654,144 @@ class RoundSession:
                 )
             else:
                 oracle.status("All research rounds returned. Finish the canonical report before presenting it.")
+            return report
+
+    def _recovery_target(self, state: dict, attempt: str | None):
+        """Pick the attempt to replay and load its evidence.
+
+        By default, the newest attempt with at least one saved successful finding:
+        a newer attempt holding only failures must not strand older usable evidence.
+        """
+        if attempt is None:
+            for previous in reversed(state["attempts"]):
+                folder = self.path / previous["directory"]
+                if not (folder / EVIDENCE_DIR).is_dir():
+                    continue
+                try:
+                    evidence = load_scout_evidence(folder)
+                except (OSError, ValueError, KeyError, TypeError):
+                    continue  # unreadable evidence: fall through to an older attempt
+                if any(not r.error for r in evidence[0]):
+                    return folder, previous["directory"], evidence
+            raise ValueError("No retained scout evidence in this session")
+        folder = (self.path / attempt).resolve()
+        if (folder.parent != (self.path / "rounds").resolve()
+                or not _ATTEMPT_NAME.fullmatch(folder.name) or not folder.is_dir()):
+            raise ValueError("Recovery target must be an attempt directory under rounds/")
+        relative = folder.relative_to(self.path).as_posix()
+        evidence = load_scout_evidence(folder)
+        if not any(not r.error for r in evidence[0]):
+            raise ValueError(f"No retained scout evidence to organize in {relative}")
+        return folder, relative, evidence
+
+    async def recover_organizers(self, attempt: str | None = None, *, verbose: bool = False) -> str:
+        """Re-run only the organizers over an attempt's saved scout evidence.
+
+        Bounded replay: no Architect and no scouts are launched, and each chain's
+        organizer sees only that chain's saved findings. The result is written to
+        a new rounds/<attempt>/recovery-NNN/ directory; canonical.md, earlier
+        reports, and the round budget are never touched. Defaults to the newest
+        attempt with usable evidence. Takes the round lock like run_round, so it
+        cannot race a running round.
+        """
+        from .sdk import OracleSDK
+
+        with _session_lock(self.path / ".round.lock"):
+            state = self.status()
+            before = json.dumps(state, sort_keys=True)
+            if self._interrupt_stale(state):
+                state.update(status="failed", research_outcome="failed", current_phase="failed",
+                             active_attempt=None)
+            try:
+                folder, relative, (scout_results, complete, missing, plan_known) = \
+                    self._recovery_target(state, attempt)
+            except BaseException:
+                if json.dumps(state, sort_keys=True) != before:  # keep the reconciliation
+                    state["last_updated_at"] = _now()
+                    self._persist_state(state)
+                raise
+            number = 1
+            while True:
+                target = folder / f"recovery-{number:03d}"
+                try:
+                    target.mkdir()
+                    break
+                except FileExistsError:
+                    number += 1
+            resume_phase = state["current_phase"]
+            entry = {
+                "attempt": relative,
+                "directory": target.relative_to(self.path).as_posix(),
+                "status": "running",
+                "started_at": _now(),
+                "complete_evidence": complete,
+                "missing_scouts": missing,
+                # Lets a later reconciliation restore the lifecycle if this process dies.
+                "previous_phase": resume_phase,
+            }
+            state["recoveries"].append(entry)
+            state.update(current_phase="recovery", active_attempt=entry["directory"],
+                         last_updated_at=_now(), next_action="Wait for organizer recovery")
+            self._persist_state(state)
+
+            oracle = None
+            usage_recorded = False
+            try:
+                oracle = OracleSDK(
+                    chains=len({r.chain for r in scout_results}), verbose=verbose,
+                    local_tools=state["local_tools"], show_dollars=state["show_dollars"],
+                )
+                oracle.status(f"Organizer recovery {number} for {relative} | session: {self.path}")
+                body = await oracle.reorganize(scout_results)
+                round_number = int(_ATTEMPT_NAME.fullmatch(folder.name)[1])
+                header = f"# Oracle round {round_number}: organizer recovery {number} ({relative})\n\n"
+                if not complete:
+                    saved = sum(not r.error for r in scout_results)
+                    if not plan_known:
+                        gap = "The planned scouts are unknown (the plan was not saved), so missing coverage cannot be listed."
+                    elif missing:
+                        gap = "Not retained: Smith " + ", ".join(f"#{i}" for i in missing) + "."
+                    else:
+                        gap = "Scouting did not record its final effective set."
+                    header += f"> **Incomplete evidence set.** Organized the {saved} saved findings. {gap}\n\n"
+                report = header + body
+                _atomic_write(target / "report.md", report)
+                metrics = asdict(oracle.metrics)
+                metrics["elapsed_seconds"] = oracle.metrics.total_time
+                metrics["total_usage"] = asdict(oracle.metrics.total_usage)
+                metrics["replayed_from"] = relative
+                metrics["complete_evidence"] = complete
+                _write_json(target / "metrics.json", metrics)
+
+                usage = oracle.metrics.total_usage
+                entry.update(status="completed", finished_at=_now(),
+                             research_outcome=self._research_outcome(oracle.metrics),
+                             usage=self._usage_snapshot(usage))
+                # Organizer-only spend, added once; the replayed scouts are not re-counted.
+                state["reported_usage"] = self._record_usage(state, usage, had_prior_attempts=True)
+                usage_recorded = True
+                state["artifact_paths"] = self._artifact_paths(
+                    self.path, state["artifact_paths"], target, ("report.md", "metrics.json")
+                )
+                state.update(current_phase=resume_phase, active_attempt=None, last_updated_at=_now(),
+                             next_action=f"Read {entry['directory']}/report.md; the round budget is "
+                                         "unchanged, so continue with a fresh plan")
+                self._persist_state(state)
+            except BaseException as exc:
+                entry.update(status="failed", error=str(exc) or type(exc).__name__, finished_at=_now())
+                if oracle is not None:
+                    entry["usage"] = self._usage_snapshot(oracle.metrics.total_usage)
+                    if not usage_recorded:
+                        # Organizer spend happened; if it was not observed, the total becomes unknown.
+                        state["reported_usage"] = self._record_usage(
+                            state, oracle.metrics.total_usage, had_prior_attempts=True
+                        )
+                state.update(current_phase=resume_phase, active_attempt=None, last_updated_at=_now(),
+                             next_action="Organizer recovery failed; inspect the error, then recover again or resume")
+                try:
+                    self._persist_state(state)
+                except OSError:
+                    pass
+                raise
+            oracle.status(f"Recovered report: {target / 'report.md'}")
             return report
