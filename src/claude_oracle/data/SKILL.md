@@ -116,7 +116,9 @@ python -m claude_oracle --session-status research/oracle-topic-run1
 
 The status snapshot includes lifecycle, research outcome, checkpoint, usage, and
 live scout/organizer progress. Token fields are unavailable when the provider
-did not report usage; do not interpret missing usage as zero.
+did not report usage; do not interpret missing usage as zero. Report
+`reported_usage.recorded` and its `incomplete_executions` count instead. While the
+Architect plans, the phase is `planning` and progress totals are `null`.
 
 ## Evolve the next round and the report
 

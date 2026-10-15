@@ -45,19 +45,53 @@ def _status_defaults(state: dict) -> dict:
     state.setdefault("checkpoint", {"path": "canonical.md", "revision": None, "through_round": 0})
     state.setdefault("artifact_paths", [])
     state.setdefault("recoveries", [])
-    usage = state.setdefault("reported_usage", _empty_reported_usage())
-    if not isinstance(usage, dict):
-        usage = _empty_reported_usage()
-        state["reported_usage"] = usage
-    usage.setdefault("available", False)
-    for key in _USAGE_FIELDS:
-        usage.setdefault(key, None)
-    if usage["available"] and any(usage[key] is None for key in _USAGE_FIELDS):
-        usage["available"] = False
-    if not usage["available"]:
-        for key in _USAGE_FIELDS:
-            usage[key] = None
+    entries = state.get("attempts"), state.get("recoveries")
+    if all(isinstance(e, list) and all(isinstance(x, dict) for x in e) for e in entries):
+        state["reported_usage"] = _session_usage(state)
+    else:
+        state.pop("reported_usage", None)  # malformed containers: let validation reject the file
     return state
+
+
+def _numbers(part) -> dict | None:
+    """The usage fields of `part` if every one is a real number, else None."""
+    if not isinstance(part, dict):
+        return None
+    values = {key: part.get(key) for key in _USAGE_FIELDS}
+    if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in values.values()):
+        return values
+    return None
+
+
+def _session_usage(state: dict) -> dict:
+    """Session usage, derived from each finished execution's own usage record.
+
+    Derived rather than accumulated, so re-deriving can never double-count, and
+    one execution with unknown usage cannot hide the rest: the exact fields are
+    null whenever any execution's usage is unknown, while `recorded` keeps the
+    sum of everything the provider did report and says how complete it is.
+    """
+    recorded = {key: 0 for key in _USAGE_FIELDS}
+    executions = incomplete = 0
+    for entry in [*state["attempts"], *state["recoveries"]]:
+        if entry.get("status") == "running":
+            continue  # in flight: counted when it finishes or is found dead
+        executions += 1
+        snapshot = entry.get("usage") if isinstance(entry.get("usage"), dict) else {}
+        # Exact only if it says so AND carries real numbers; anything else is unknown.
+        exact = _numbers(snapshot) if snapshot.get("available") is True else None
+        if exact is None:
+            incomplete += 1
+        # A v4.8.0 record has no `recorded` block: its exact fields are all it reported.
+        part = _numbers(snapshot.get("recorded")) or exact or {}
+        for key in _USAGE_FIELDS:
+            recorded[key] += part.get(key, 0)
+    exact = executions > 0 and incomplete == 0
+    return {
+        **{key: recorded[key] if exact else None for key in _USAGE_FIELDS},
+        "available": exact,
+        "recorded": {**recorded, "executions": executions, "incomplete_executions": incomplete},
+    }
 
 
 def _positive_integer(value: int, label: str) -> int:
@@ -146,9 +180,13 @@ def _state_lock(path: Path):
 
 
 def _usage_record(usage) -> dict:
-    if not getattr(usage, "usage_observed", False) or not getattr(usage, "usage_available", False):
-        return _empty_reported_usage()
-    return {**{key: getattr(usage, key, None) for key in _USAGE_FIELDS}, "available": True}
+    """One execution's usage: exact fields, or null if any of its model work went
+    unreported. `recorded` always keeps the numbers the provider did report."""
+    observed = getattr(usage, "usage_observed", False)
+    recorded = {key: getattr(usage, key, 0) if observed else 0 for key in _USAGE_FIELDS}
+    if not observed or not getattr(usage, "usage_available", False):
+        return {**_empty_reported_usage(), "recorded": recorded}
+    return {**recorded, "available": True, "recorded": dict(recorded)}
 
 
 class ScoutEvidenceWriter:
@@ -346,7 +384,7 @@ class RoundSession:
             "next_action": "Run the first research round",
             "checkpoint": {"path": "canonical.md", "revision": None, "through_round": 0},
             "artifact_paths": [],
-            "reported_usage": _empty_reported_usage(),
+            "reported_usage": _session_usage({"attempts": [], "recoveries": []}),
             "question": question.strip(),
             "rounds": rounds,
             "chains": chains,
@@ -403,6 +441,7 @@ class RoundSession:
     def _persist_state(self, state: dict) -> None:
         """Write state while preserving a checkpoint recorded by another process."""
         state["schema_version"] = SCHEMA_VERSION
+        state["reported_usage"] = _session_usage(state)
         with _state_lock(self.path / ".session.lock"):
             latest = self._read_state()
             state["checkpoint"] = latest["checkpoint"]
@@ -432,24 +471,7 @@ class RoundSession:
         return paths
 
     _usage_snapshot = staticmethod(_usage_record)
-
-    @staticmethod
-    def _record_usage(state: dict, usage, had_prior_attempts: bool) -> dict:
-        snapshot = RoundSession._usage_snapshot(usage)
-        reported = state["reported_usage"]
-        if not snapshot["available"]:
-            state["reported_usage"] = _empty_reported_usage()
-            return state["reported_usage"]
-        if not had_prior_attempts and not reported.get("available", False):
-            state["reported_usage"] = snapshot
-            return snapshot
-        if not reported.get("available", False):
-            state["reported_usage"] = _empty_reported_usage()
-            return state["reported_usage"]
-        for key in _USAGE_FIELDS:
-            reported[key] += snapshot[key]
-        reported["available"] = True
-        return reported
+    _session_usage = staticmethod(_session_usage)
 
     @staticmethod
     def _interrupt_stale(state: dict) -> bool:
@@ -457,16 +479,14 @@ class RoundSession:
         attempt died. Only call while holding .round.lock: holding it proves no
         live process owns anything still marked 'running'.
 
-        Dead work recorded no usage, so a session total that omits it would be a
-        silent undercount: make it unknown. A dead recovery is not a failed round:
-        it restores the lifecycle phase it displaced instead of failing the session.
+        Dead work recorded no usage, so session usage counts it as an incomplete
+        execution rather than as zero. A dead recovery is not a failed round: it
+        restores the lifecycle phase it displaced instead of failing the session.
         """
         def interrupt(entries: list) -> list:
             dead = [entry for entry in entries if entry["status"] == "running"]
             for entry in dead:
                 entry.update(status="interrupted", finished_at=_now())
-                if "usage" not in entry:
-                    state["reported_usage"] = _empty_reported_usage()
             return dead
 
         for recovery in interrupt(state["recoveries"]):
@@ -512,7 +532,6 @@ class RoundSession:
         with _session_lock(self.path / ".round.lock"):
             state = self.status()
             number = state["completed_rounds"] + 1
-            had_prior_attempts = bool(state["attempts"])
             if number > state["rounds"]:
                 raise ValueError("All requested rounds have already finished")
             if prompts is None and (number > 1 or state["attempts"]):
@@ -548,9 +567,15 @@ class RoundSession:
             state["attempts"].append(attempt)
             state["status"] = "running"
             state["research_outcome"] = "unknown"
-            state["current_phase"] = "research"
+            # Without a plan the Architect is still planning: totals are unknown
+            # (null), which a caller must not read as "zero work scheduled".
+            state["current_phase"] = "research" if prompts is not None else "planning"
             state["active_attempt"] = relative.as_posix()
-            state["progress"] = {"scouts": {"completed": 0, "total": len(prompts or []), "retained": 0}, "organizers": {"completed": 0, "total": len({p["chain"] for p in prompts or []})}}
+            state["progress"] = {
+                "scouts": {"completed": 0, "total": len(prompts) if prompts is not None else None, "retained": 0},
+                "organizers": {"completed": 0,
+                               "total": len({p["chain"] for p in prompts}) if prompts is not None else None},
+            }
             state["last_updated_at"] = _now()
             state["next_action"] = "Wait for research results"
 
@@ -595,9 +620,6 @@ class RoundSession:
                 state["current_phase"] = "complete"
                 state["active_attempt"] = None
                 state["progress"] = {"scouts": {"completed": oracle.metrics.scout_count, "total": oracle.scouts_total, "retained": evidence.retained}, "organizers": {"completed": oracle.metrics.compressor_count, "total": oracle.metrics.chain_count}}
-                state["reported_usage"] = self._record_usage(
-                    state, oracle.metrics.total_usage, had_prior_attempts
-                )
                 attempt["usage"] = self._usage_snapshot(oracle.metrics.total_usage)
                 names = ("prompts.json", "report.md", "metrics.json")
                 if (folder / EVIDENCE_DIR / "manifest.json").exists():
@@ -615,23 +637,22 @@ class RoundSession:
                     finished_at=_now(),
                     usage=self._usage_snapshot(oracle.metrics.total_usage),
                 )
-                state["reported_usage"] = self._record_usage(
-                    state, oracle.metrics.total_usage, had_prior_attempts
-                )
                 state["completed_rounds"] = number - 1
                 state["status"] = "failed"
                 state["research_outcome"] = "failed"
                 state["current_phase"] = "failed"
                 state["active_attempt"] = None
+                # A round that died while planning never learned its totals.
+                planned = prompts is not None or bool(oracle.planned_prompts)
                 state["progress"] = {
                     "scouts": {
                         "completed": min(oracle.metrics.scout_count, oracle.scouts_total),
-                        "total": oracle.scouts_total,
+                        "total": oracle.scouts_total if planned else None,
                         "retained": evidence.retained,
                     },
                     "organizers": {
                         "completed": min(oracle.metrics.compressor_count, oracle.metrics.chain_count),
-                        "total": oracle.metrics.chain_count,
+                        "total": oracle.metrics.chain_count if planned else None,
                     },
                 }
                 state["last_updated_at"] = _now()
@@ -694,7 +715,7 @@ class RoundSession:
         attempt with usable evidence. Takes the round lock like run_round, so it
         cannot race a running round.
         """
-        from .sdk import OracleSDK
+        from .sdk import OracleSDK, UsageStats
 
         with _session_lock(self.path / ".round.lock"):
             state = self.status()
@@ -735,7 +756,6 @@ class RoundSession:
             self._persist_state(state)
 
             oracle = None
-            usage_recorded = False
             try:
                 oracle = OracleSDK(
                     chains=len({r.chain for r in scout_results}), verbose=verbose,
@@ -766,10 +786,8 @@ class RoundSession:
                 usage = oracle.metrics.total_usage
                 entry.update(status="completed", finished_at=_now(),
                              research_outcome=self._research_outcome(oracle.metrics),
+                             # Organizer-only spend: the replayed scouts belong to their own attempt.
                              usage=self._usage_snapshot(usage))
-                # Organizer-only spend, added once; the replayed scouts are not re-counted.
-                state["reported_usage"] = self._record_usage(state, usage, had_prior_attempts=True)
-                usage_recorded = True
                 state["artifact_paths"] = self._artifact_paths(
                     self.path, state["artifact_paths"], target, ("report.md", "metrics.json")
                 )
@@ -779,13 +797,13 @@ class RoundSession:
                 self._persist_state(state)
             except BaseException as exc:
                 entry.update(status="failed", error=str(exc) or type(exc).__name__, finished_at=_now())
-                if oracle is not None:
-                    entry["usage"] = self._usage_snapshot(oracle.metrics.total_usage)
-                    if not usage_recorded:
-                        # Organizer spend happened; if it was not observed, the total becomes unknown.
-                        state["reported_usage"] = self._record_usage(
-                            state, oracle.metrics.total_usage, had_prior_attempts=True
-                        )
+                # Recovery's only model work is organizers, which mark their usage
+                # observed when dispatched. Nothing observed means nothing ran: known
+                # zero spend, not unknown spend.
+                spent = oracle.metrics.total_usage if oracle is not None else UsageStats()
+                entry["usage"] = self._usage_snapshot(
+                    spent if spent.usage_observed else UsageStats(usage_observed=True, usage_available=True)
+                )
                 state.update(current_phase=resume_phase, active_attempt=None, last_updated_at=_now(),
                              next_action="Organizer recovery failed; inspect the error, then recover again or resume")
                 try:

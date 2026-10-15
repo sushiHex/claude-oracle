@@ -127,8 +127,28 @@ updated as scouts and organizers finish, so `--session-status` can be polled
 while a round is running. `progress.scouts.completed` counts scouts that **ran**;
 `progress.scouts.retained` counts successful findings **saved on disk**, which is
 what survives if the process dies. Sessions written by versions before `retained`
-existed omit it. These fields are runtime evidence, not a judgment about prose
-quality.
+existed omit it. While the Architect is still planning a round that was started
+without a plan, `current_phase` is `planning` and both progress `total` values are
+`null`: the amount of work is not known yet, which is different from zero. A round
+that fails during planning keeps them `null`. These fields are runtime evidence,
+not a judgment about prose quality.
+
+`reported_usage` is derived from every finished execution (round attempts and
+recoveries), each of which keeps its own `usage` record. Its token, cost, and quota
+fields are exact sums only when every execution reported usage (`available: true`);
+otherwise they are `null`, because the true total is unknown. `reported_usage.recorded`
+is always present: the same fields summed over everything the provider *did* report,
+plus `executions` and `incomplete_executions` (finished executions whose usage is
+unknown, including attempts found interrupted). Present it as, for example,
+"254,950 recorded tokens; usage unknown for 1 of 5 executions". It is not a bound on
+actual spend: unreported work may have cost anything, and a phase interrupted midway
+(a killed round, a cancelled organizer pass) can lose usage that its finished calls
+had already reported, because phase usage is aggregated when the phase completes. Each execution's own `usage`
+has the same shape: exact fields or `null`, plus its `recorded` numbers. Records
+written before v4.9.0 have no `recorded` block; an unavailable one contributes
+nothing to the recorded sum and counts as incomplete. The report footer follows the
+same rule: when any model work went unreported it prints **Recorded tokens** with an
+"incomplete" note instead of a total.
 
 The caller records editorial progress explicitly after revising the canonical
 report: `session.checkpoint(revision="git-or-content-revision", through_round=1)`.
@@ -142,7 +162,7 @@ After launching each subsequent round, **strengthen the same `canonical.md` to f
 
 During round one, establish scope and known context without inventing research results. After the last round, make a final substantive revision incorporating its findings. Default to one canonical report throughout the session, including resumes; create additional canonical documents only when explicitly instructed. Raw round outputs are supporting evidence, not separate final reports.
 
-The runtime writes a scaffold once and then leaves the canonical report to the caller. It does not enforce editorial quality or determine when writing is complete. Deliver the report path, conclusions, unresolved questions, and total usage across rounds. Usage fields are marked unavailable when the provider did not return token data; do not treat missing usage as zero.
+The runtime writes a scaffold once and then leaves the canonical report to the caller. It does not enforce editorial quality or determine when writing is complete. Deliver the report path, conclusions, unresolved questions, and total usage across rounds. Usage fields are marked unavailable when the provider did not return token data; do not treat missing usage as zero. When they are, report `reported_usage.recorded` with its incomplete-execution count instead.
 
 ### State and recovery
 
@@ -190,7 +210,7 @@ python -m claude_oracle --recover research/queues-run1
 
 From Python: `await RoundSession.open(path).recover_organizers()`, or pass `attempt="rounds/round-001-attempt-001"` to choose an attempt other than the latest one with evidence.
 
-Recovery launches **no Architect and no scouts**. It runs one organizer per chain, each seeing only its own chain's saved findings, with the usual organizer timeout. The report is printed and written to a new `recovery-NNN/` directory in that attempt; `canonical.md`, earlier reports, and scout records are never modified. Recovery does **not** change the round budget or `completed_rounds`: read the recovered report, then continue with a fresh plan as usual. Each recovery is recorded under `recoveries` in `session.json` with its own organizer-only `usage`, which is added to `reported_usage` once; the replayed scouts are not counted again. An incomplete evidence set is labeled at the top of the recovered report, and each missing scout reaches its organizer as an explicit error. While recovery runs, status shows `current_phase: "recovery"` with `active_attempt` pointing at the `recovery-NNN/` directory; afterwards the phase returns to its previous value. If recovery fails, its entry is marked `failed` and any organizer spend that was not observed makes `reported_usage` unavailable rather than undercounted. Recovery takes the round lock, so it refuses to run while a round is running; if persisted status still says `running` but the lock is free, recovery marks that attempt (or an earlier recovery) `interrupted`.
+Recovery launches **no Architect and no scouts**. It runs one organizer per chain, each seeing only its own chain's saved findings, with the usual organizer timeout. The report is printed and written to a new `recovery-NNN/` directory in that attempt; `canonical.md`, earlier reports, and scout records are never modified. Recovery does **not** change the round budget or `completed_rounds`: read the recovered report, then continue with a fresh plan as usual. Each recovery is recorded under `recoveries` in `session.json` with its own organizer-only `usage`, which counts toward `reported_usage` as one execution; the replayed scouts belong to their original attempt and are not counted again. An incomplete evidence set is labeled at the top of the recovered report, and each missing scout reaches its organizer as an explicit error. While recovery runs, status shows `current_phase: "recovery"` with `active_attempt` pointing at the `recovery-NNN/` directory; afterwards the phase returns to its previous value. If recovery fails, its entry is marked `failed` with whatever usage its organizers reported; organizer spend that was not observed makes it an incomplete execution rather than an undercount. A recovery that failed before any model started records zero usage. Recovery takes the round lock, so it refuses to run while a round is running; if persisted status still says `running` but the lock is free, recovery marks that attempt (or an earlier recovery) `interrupted`.
 
 | Status | Meaning and next action |
 | --- | --- |
@@ -199,7 +219,7 @@ Recovery launches **no Architect and no scouts**. It runs one organizer per chai
 | `failed` | An exception or cancellation stopped the attempt; diagnose and resume with a new plan. |
 | `rounds_complete` | All requested research calls returned; finish the canonical report. |
 
-An OS lock prevents simultaneous rounds in one session and releases on process exit. The one-byte `.round.lock` and `.session.lock` files remain after a crash by design; the lock is held by the process, not by the file, so leftover files never block resume or recovery. On Windows the OS releases a killed process's locks asynchronously, so a resume or recovery started immediately after a crash can briefly report that a round is running; retry after a few seconds. After a crash, persisted status may still say `running`; once the old process has exited, resume marks that attempt `interrupted` and retries the same round in a new directory. A crashed attempt never recorded its usage, so marking it interrupted also makes the session's `reported_usage` unavailable: the true total is unknown, and reporting the earlier figure would silently omit that attempt's spend. Failed and interrupted attempts remain on disk and do not consume the round budget. A returned report with model errors **does** count as a round: inspect metrics and diagnose systemic failures before spending further rounds.
+An OS lock prevents simultaneous rounds in one session and releases on process exit. The one-byte `.round.lock` and `.session.lock` files remain after a crash by design; the lock is held by the process, not by the file, so leftover files never block resume or recovery. On Windows the OS releases a killed process's locks asynchronously, so a resume or recovery started immediately after a crash can briefly report that a round is running; retry after a few seconds. After a crash, persisted status may still say `running`; once the old process has exited, resume marks that attempt `interrupted` and retries the same round in a new directory. A crashed attempt never recorded its usage, so once it is marked interrupted it counts as an incomplete execution: the exact `reported_usage` fields become `null` (the true total is unknown, and the earlier figure would silently omit that attempt's spend), while `reported_usage.recorded` keeps every other execution's reported usage. Failed and interrupted attempts remain on disk and do not consume the round budget. A returned report with model errors **does** count as a round: inspect metrics and diagnose systemic failures before spending further rounds.
 
 ### Python sessions
 
