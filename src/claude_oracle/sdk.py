@@ -819,6 +819,7 @@ GitHub MCP tools available — prefer these over WebSearch for repo data:
         # failed: that pattern means something systemic (auth, network), and
         # a serial retry pass would just repeat it slowly.
         failed_idx = [i for i, r in enumerate(results) if r.error]
+        superseded: list[UsageStats] = []  # a retried attempt's spend still happened
         if failed_idx and len(failed_idx) <= max(1, len(results) // 2):
             self.status(f"  Retry pass: {len(failed_idx)} failed Smith(s), one serial relaunch each")
             for i in failed_idx:
@@ -847,6 +848,7 @@ GitHub MCP tools available — prefer these over WebSearch for repo data:
                 if not retry.error:
                     self.status(f"  Smith #{p['id']} ({p['dimension']}) RECOVERED on retry")
                 self._retain("scout_finished", p, retry, 2)
+                superseded.append(results[i].usage)
                 results[i] = retry
         elif failed_idx:
             self.status(f"  Retry pass SKIPPED: {len(failed_idx)}/{len(results)} Smiths failed (systemic)")
@@ -859,6 +861,8 @@ GitHub MCP tools available — prefer these over WebSearch for repo data:
             if r.error:
                 self.metrics.scout_errors += 1
             phase_usage.add(r.usage)
+        for usage in superseded:
+            phase_usage.add(usage)
 
         self.metrics.scout_count = len(results)
         elapsed = time.time() - t0
@@ -1018,6 +1022,7 @@ Organize, don't compress — the calling session will do the editorial judgment.
                 skipped.append(CompressorResult(
                     chain=chain, summary="",
                     error="All Smiths failed for this chain — Anderson skipped",
+                    usage=UsageStats(),  # nothing ran, so nothing is unknown
                 ))
                 self._completed_organizers += 1
                 self._emit_progress("organize")
@@ -1164,19 +1169,34 @@ Organize, don't compress — the calling session will do the editorial judgment.
         parts.append(f"{self.chains} Anderson{'s' if self.chains > 1 else ''}")
         parts.append("Caller (you)")
         arch = " -> ".join(parts)
+
+        # Same contract as session.json: figures are exact only when every model
+        # execution reported usage; otherwise they cover just what was reported.
+        def complete(u: UsageStats) -> bool:
+            return u.usage_observed and u.usage_available
+
+        def mark(u: UsageStats) -> str:  # a phase that never ran is not incomplete
+            return " (incomplete)" if u.usage_observed and not u.usage_available else ""
+
         if self.show_dollars:
-            cost_line = f"- Total cost: ${total.cost_usd:.4f}"
-            phase_costs = ' | '.join(f'{k}: ${u.cost_usd:.4f}' for k, u in m.phase_usage.items())
+            cost_line = f"- Total cost: ${total.cost_usd:.4f}{'' if complete(total) else ' (incomplete)'}"
+            phase_costs = ' | '.join(f'{k}: ${u.cost_usd:.4f}{mark(u)}' for k, u in m.phase_usage.items())
         else:
-            cost_line = f"- Quota: {total.weekly_pct:.2f}% weekly ({total.session_pct:.1f}% session)"
-            phase_costs = ' | '.join(f'{k}: {u.weekly_pct:.2f}%' for k, u in m.phase_usage.items())
+            cost_line = (f"- Quota: {total.weekly_pct:.2f}% weekly ({total.session_pct:.1f}% session)"
+                         f"{'' if complete(total) else ' (incomplete)'}")
+            phase_costs = ' | '.join(f'{k}: {u.weekly_pct:.2f}%{mark(u)}' for k, u in m.phase_usage.items())
+        label = "Total tokens" if complete(total) else "Recorded tokens"
+        caveat = "" if complete(total) else (
+            "\n- Usage incomplete: some model work returned no usage data, so these figures "
+            "cover only what was reported (not a bound on actual spend)"
+        )
         footer = f"""
 
 ---
 **Oracle SDK Execution Metrics**
 - Architecture: {arch}
 - Total time: {m.total_time:.0f}s
-- Total tokens: {total.total_tokens:,} (in: {total.input_tokens:,} | out: {total.output_tokens:,} | cache r/w: {total.cache_read_input_tokens:,}/{total.cache_creation_input_tokens:,})
+- {label}: {total.total_tokens:,} (in: {total.input_tokens:,} | out: {total.output_tokens:,} | cache r/w: {total.cache_read_input_tokens:,}/{total.cache_creation_input_tokens:,}){caveat}
 {cost_line}
 - Smiths: {m.scout_count} ({m.scout_errors} errors)
 - Andersons: {m.compressor_count} ({m.compressor_errors} errors)
