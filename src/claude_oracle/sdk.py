@@ -604,6 +604,9 @@ Return ONLY a JSON array:
                 await _aclose(gen)
         except Exception as e:
             raise RuntimeError(f"Architect query failed: {e}") from e
+        finally:
+            # Spent even if the plan turns out unusable: record it before parsing.
+            self.metrics.phase_usage["decompose"] = usage
 
         try:
             prompts = _extract_json_array(result_text)
@@ -612,7 +615,6 @@ Return ONLY a JSON array:
 
         elapsed = time.time() - t0
         self.metrics.phase_times["decompose"] = elapsed
-        self.metrics.phase_usage["decompose"] = usage
         self.status(f"  Architect designed {len(prompts)} Smiths ({elapsed:.1f}s) | {usage}")
         return prompts
 

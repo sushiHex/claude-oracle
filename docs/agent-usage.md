@@ -141,7 +141,9 @@ is always present: the same fields summed over everything the provider *did* rep
 plus `executions` and `incomplete_executions` (finished executions whose usage is
 unknown, including attempts found interrupted). Present it as, for example,
 "254,950 recorded tokens; usage unknown for 1 of 5 executions". It is not a bound on
-actual spend: unreported work may have cost anything. Each execution's own `usage`
+actual spend: unreported work may have cost anything, and a phase interrupted midway
+(a killed round, a cancelled organizer pass) can lose usage that its finished calls
+had already reported, because phase usage is aggregated when the phase completes. Each execution's own `usage`
 has the same shape: exact fields or `null`, plus its `recorded` numbers. Records
 written before v4.9.0 have no `recorded` block; an unavailable one contributes
 nothing to the recorded sum and counts as incomplete. The report footer follows the

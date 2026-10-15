@@ -170,6 +170,78 @@ def test_recovery_that_never_started_a_model_is_not_unknown_spend(monkeypatch):
     assert usage["available"] is True and usage["input_tokens"] == 10
 
 
+def test_recovery_failing_before_any_dispatch_is_not_unknown_spend(monkeypatch):
+    session = RoundSession.create("question")
+    run_with_usage(monkeypatch, known(10))
+    asyncio.run(session.run_round(plan()))
+    folder = session.path / session.status()["attempts"][0]["directory"] / rounds_module.EVIDENCE_DIR
+    folder.mkdir(exist_ok=True)
+    writer = rounds_module.ScoutEvidenceWriter(folder)
+    prompts = sdk._normalize_prompts(plan())
+    writer.plan_ready(prompts)
+    writer.scout_finished(prompts[0], sdk.ScoutResult(scout_id=1, chain="A", dimension="d",
+                                                      result_text="found", usage=known(1)), 1)
+
+    async def fails_before_organizers(self, scout_results):
+        raise RuntimeError("stderr closed")
+
+    monkeypatch.setattr(sdk.OracleSDK, "reorganize", fails_before_organizers)
+    with pytest.raises(RuntimeError, match="stderr closed"):
+        asyncio.run(session.recover_organizers())
+    assert session.status()["reported_usage"]["available"] is True
+
+
+def test_new_session_file_already_has_the_recorded_block():
+    session = RoundSession.create("question")
+    on_disk = json.loads((session.path / "session.json").read_text(encoding="utf-8"))
+    assert on_disk["reported_usage"]["recorded"]["executions"] == 0
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda s: s.update(recoveries=None),
+    lambda s: s.update(attempts=[None]),
+])
+def test_malformed_containers_get_the_clean_rejection(mutate):
+    session = RoundSession.create("question")
+    state = json.loads((session.path / "session.json").read_text(encoding="utf-8"))
+    mutate(state)
+    (session.path / "session.json").write_text(json.dumps(state), encoding="utf-8")
+    with pytest.raises(ValueError, match="Invalid Oracle round session state"):
+        RoundSession.open(session.path).status()
+
+
+@pytest.mark.parametrize("snapshot", [
+    {"available": True},                                        # numbers missing
+    {"available": True, "input_tokens": "10", "output_tokens": 1, "cache_read_input_tokens": 0,
+     "cache_creation_input_tokens": 0, "cost_usd": 0, "quota_units": 0},  # a string
+    {"available": True, "input_tokens": True, "output_tokens": 1, "cache_read_input_tokens": 0,
+     "cache_creation_input_tokens": 0, "cost_usd": 0, "quota_units": 0},  # a bool
+])
+def test_malformed_usage_record_counts_as_incomplete_not_exact(snapshot):
+    usage = RoundSession._session_usage({"attempts": [{"status": "completed", "usage": snapshot}],
+                                         "recoveries": []})
+    assert usage["available"] is False
+    assert usage["recorded"]["incomplete_executions"] == 1
+    assert usage["recorded"]["input_tokens"] == 0
+
+
+def test_architect_usage_survives_an_unusable_plan(monkeypatch):
+    session = RoundSession.create("question")
+
+    async def fake_query(*args, **kwargs):
+        class Message:
+            result = "not a JSON plan"
+            usage = {"input_tokens": 12, "output_tokens": 34}
+        yield Message()
+
+    monkeypatch.setattr(sdk, "query", fake_query)
+    with pytest.raises(RuntimeError, match="valid prompt list"):
+        asyncio.run(session.run_round())
+    attempt = session.status()["attempts"][0]
+    assert attempt["usage"]["available"] is True
+    assert attempt["usage"]["input_tokens"] == 12
+
+
 # --- engine accounting that fed the aggregate wrong numbers ------------------------
 
 def test_retry_keeps_the_first_attempts_usage(monkeypatch):

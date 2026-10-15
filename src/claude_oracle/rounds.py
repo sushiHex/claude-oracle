@@ -45,10 +45,22 @@ def _status_defaults(state: dict) -> dict:
     state.setdefault("checkpoint", {"path": "canonical.md", "revision": None, "through_round": 0})
     state.setdefault("artifact_paths", [])
     state.setdefault("recoveries", [])
-    if isinstance(state.get("attempts"), list) and all(isinstance(e, dict) for e in
-                                                       [*state["attempts"], *state["recoveries"]]):
+    entries = state.get("attempts"), state.get("recoveries")
+    if all(isinstance(e, list) and all(isinstance(x, dict) for x in e) for e in entries):
         state["reported_usage"] = _session_usage(state)
+    else:
+        state.pop("reported_usage", None)  # malformed containers: let validation reject the file
     return state
+
+
+def _numbers(part) -> dict | None:
+    """The usage fields of `part` if every one is a real number, else None."""
+    if not isinstance(part, dict):
+        return None
+    values = {key: part.get(key) for key in _USAGE_FIELDS}
+    if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in values.values()):
+        return values
+    return None
 
 
 def _session_usage(state: dict) -> dict:
@@ -66,13 +78,14 @@ def _session_usage(state: dict) -> dict:
             continue  # in flight: counted when it finishes or is found dead
         executions += 1
         snapshot = entry.get("usage") if isinstance(entry.get("usage"), dict) else {}
-        if not snapshot.get("available"):
+        # Exact only if it says so AND carries real numbers; anything else is unknown.
+        exact = _numbers(snapshot) if snapshot.get("available") is True else None
+        if exact is None:
             incomplete += 1
-        part = snapshot.get("recorded")
-        if not isinstance(part, dict):  # a v4.8.0 record carries exact fields only
-            part = snapshot if snapshot.get("available") else {}
+        # A v4.8.0 record has no `recorded` block: its exact fields are all it reported.
+        part = _numbers(snapshot.get("recorded")) or exact or {}
         for key in _USAGE_FIELDS:
-            recorded[key] += part.get(key) or 0
+            recorded[key] += part.get(key, 0)
     exact = executions > 0 and incomplete == 0
     return {
         **{key: recorded[key] if exact else None for key in _USAGE_FIELDS},
@@ -371,7 +384,7 @@ class RoundSession:
             "next_action": "Run the first research round",
             "checkpoint": {"path": "canonical.md", "revision": None, "through_round": 0},
             "artifact_paths": [],
-            "reported_usage": _empty_reported_usage(),
+            "reported_usage": _session_usage({"attempts": [], "recoveries": []}),
             "question": question.strip(),
             "rounds": rounds,
             "chains": chains,
@@ -784,10 +797,12 @@ class RoundSession:
                 self._persist_state(state)
             except BaseException as exc:
                 entry.update(status="failed", error=str(exc) or type(exc).__name__, finished_at=_now())
-                # No engine means no model ran: that is known zero spend, not unknown spend.
+                # Recovery's only model work is organizers, which mark their usage
+                # observed when dispatched. Nothing observed means nothing ran: known
+                # zero spend, not unknown spend.
+                spent = oracle.metrics.total_usage if oracle is not None else UsageStats()
                 entry["usage"] = self._usage_snapshot(
-                    oracle.metrics.total_usage if oracle is not None
-                    else UsageStats(usage_observed=True, usage_available=True)
+                    spent if spent.usage_observed else UsageStats(usage_observed=True, usage_available=True)
                 )
                 state.update(current_phase=resume_phase, active_attempt=None, last_updated_at=_now(),
                              next_action="Organizer recovery failed; inspect the error, then recover again or resume")
