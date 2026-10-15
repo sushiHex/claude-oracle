@@ -48,7 +48,7 @@ if "CLAUDECODE" in os.environ:
 # setuptools' dynamic `attr =` (a plain literal, so it is parsed statically, not
 # imported), and the CLI banner formats it below — so a release bumps this and
 # the packaged SKILL.md header, and nothing else can drift out of step.
-__version__ = "4.8.0"
+__version__ = "4.9.0"
 
 # ---------------------------------------------------------------------------
 # Defaults
